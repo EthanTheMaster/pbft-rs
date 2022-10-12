@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use crate::pbft::{PBFTEvent, Peer, PeerId, PeerIndex, ServiceOperation};
+use crate::kernel::{PBFTEvent, Peer, PeerId, PeerIndex, ServiceOperation};
 
 type SignatureResult = Vec<u8>;
 
@@ -33,6 +33,7 @@ pub struct CommunicationProxy<O>
 
 type Peers<O> = Vec<(Peer, UnboundedSender<WrappedPBFTEvent<O>>)>;
 
+// TODO: Implement rebroadcasting to subvert byzantine peers
 impl<O> CommunicationProxy<O>
     where O: ServiceOperation
 {
@@ -81,6 +82,23 @@ impl<O> CommunicationProxy<O>
             // TODO: Handle send error
             let _ = s.send(wrapped_msg);
         }
+    }
+
+    pub fn send(&self, to: PeerIndex, event: PBFTEvent<O>) {
+        if to as usize >= self.indexed_participants.len() {
+            panic!("Peer {} is not valid!", to);
+        }
+        let peer = self.indexed_participants.get(to as usize).unwrap();
+        let sender = &self.peer_db.get(&peer.id).unwrap().1;
+
+        // TODO: Compute digital signature
+        let wrapped_msg = WrappedPBFTEvent {
+            event: event.clone(),
+            from: "".to_string(),
+            signature: None,
+        };
+        // TODO: Handle send error
+        let _ = sender.send(wrapped_msg);
     }
 
     pub fn num_peers(&self) -> usize {

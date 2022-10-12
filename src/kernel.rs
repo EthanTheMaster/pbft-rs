@@ -114,7 +114,9 @@ pub enum PBFTEvent<O>
     },
 }
 
-pub struct Checkpoint<O> {
+pub struct Checkpoint<O>
+    where O: ServiceOperation
+{
     sequence_number: SequenceNumber,
     service_state: ServiceState<O>,
 }
@@ -190,6 +192,22 @@ impl<O> PBFTState<O>
         }
     }
 
+    pub fn is_view_active(&self) -> bool {
+        self.is_view_active
+    }
+    pub fn view(&self) -> ViewstampId {
+        self.view
+    }
+    pub fn message_log(&self) -> &Vec<PBFTEvent<O>> {
+        &self.message_log
+    }
+    pub fn last_executed(&self) -> SequenceNumber {
+        self.last_executed
+    }
+    pub fn current_state(&self) -> &ServiceState<O> {
+        &self.current_state
+    }
+
     pub async fn step(&mut self) {
         let event = self.communication_proxy.recv_event().await;
         match event {
@@ -215,9 +233,25 @@ impl<O> PBFTState<O>
     }
 
     pub fn max_faults(&self) -> PeerIndex {
-        // n >= 3f + 1
+        // Compute biggest integer f such that: n >= 3f + 1
         // Integer division performs floor
         (self.num_participants - 1) / 3
+    }
+
+    pub fn quorum_size(&self) -> PeerIndex {
+        let n = self.num_participants;
+        let f = self.max_faults();
+        let sum = n + f + 1;
+        // Compute ceil(sum / 2)
+        if sum % 2 == 0 {
+            sum / 2
+        } else {
+            sum / 2 + 1
+        }
+    }
+
+    pub fn weak_certificate_size(&self) -> PeerIndex {
+        self.max_faults() + 1
     }
 
     fn is_primary(&self, participant_index: PeerIndex) -> bool {
@@ -273,11 +307,12 @@ impl<O> PBFTState<O>
             .collect::<HashSet<PeerIndex>>()
             .len();
 
-        // The replica that did preprepare is guaranteed to not be in the certificate
-        // by sending/receiving prepare precondition. Certificate proves 2f+1 replicas
-        // have preprepared the message and it is now virtually impossible for two different
-        // messages to be prepared at the current view/sequence_number pair
-        self.is_preprepared(&data) && certificate_size as PeerIndex >= 2 * self.max_faults()
+        // The replica that sent preprepare is guaranteed to not be in the certificate
+        // by sending/receiving prepare precondition (which is why there is a -1).
+        // Certificate proves a quorum of replicas have *preprepared* (either send a preprepare or prepare)
+        // the message and it is now virtually impossible for two different messages to be prepared at the current
+        // view/sequence_number pair.
+        self.is_preprepared(data) && certificate_size as PeerIndex >= self.quorum_size() - 1
     }
 
     fn is_committed(&self, data: &PrepTriple) -> bool {
@@ -299,9 +334,9 @@ impl<O> PBFTState<O>
             .collect::<HashSet<PeerIndex>>()
             .len();
 
-        // Message has been prepared and quorum has send commit. It is now impossible for a different message
+        // Message has been prepared and quorum has sent commit. It is now impossible for a different message
         // to commit in any view at this sequence number!
-        self.is_prepared(&data) && certificate_size as PeerIndex > 2*self.max_faults()
+        self.is_prepared(data) && certificate_size as PeerIndex >= self.quorum_size()
     }
 
     fn process_request(&mut self, payload: RequestPayload<O>) {
@@ -318,7 +353,7 @@ impl<O> PBFTState<O>
                 return;
             }
 
-            let request_digest = payload.op.digest().clone();
+            let request_digest = payload.op_digest.clone();
 
             let preprepare = PBFTEvent::PrePrepare {
                 from: self.my_index,
@@ -352,7 +387,7 @@ impl<O> PBFTState<O>
         let preprepare: PBFTEvent<O> = PBFTEvent::PrePrepare {
             from,
             data: data.clone(),
-            request: request.clone(),
+            request,
         };
         if !self.is_sequence_number_in_window(data.sequence_number) {
             debug!("Peer {}: Ignoring preprepare because log is currently too full. {:?}", self.my_index, preprepare);
@@ -375,10 +410,7 @@ impl<O> PBFTState<O>
 
         // All preconditions passed, record this preprepare which also contains a request
         debug!("Peer {}: Got preprepare: {:?}", self.my_index, preprepare);
-        self.message_log.push(preprepare.clone());
-
-        // Rebroadcast the preprepare to subvert byzantine primary
-        self.communication_proxy.broadcast(preprepare);
+        self.message_log.push(preprepare);
 
         // Attempt to send a prepare if possible
         if !self.is_primary(self.my_index) {
@@ -433,7 +465,7 @@ impl<O> PBFTState<O>
             return;
         }
 
-        if !self.is_prepared(&data) {
+        if !self.is_prepared(data) {
             debug!("Peer {}: Attempted to send commit, but quorum has not been achieved. {:?}", self.my_index, data);
             return;
         }
@@ -448,7 +480,7 @@ impl<O> PBFTState<O>
         self.communication_proxy.broadcast(commit);
 
         // Introduction of commit may be enough to achieve commit quorum
-        self.attempt_execute(&data);
+        self.attempt_execute(data);
     }
 
     fn process_commit(&mut self, from: PeerIndex, data: PrepTriple) {
@@ -472,8 +504,13 @@ impl<O> PBFTState<O>
     }
 
     fn attempt_execute(&mut self, data: &PrepTriple) {
+        if data.sequence_number <= self.last_executed {
+            // Don't attempt to execute something already executed
+            return;
+        }
         if !self.is_committed(data) {
             debug!("Peer {}: Attempted to perform execution but data has not been committed. {:?}", self.my_index, data);
+            return;
         }
 
         let associated_preprepare = self.message_log.iter().find(|e| {
@@ -497,20 +534,116 @@ impl<O> PBFTState<O>
                 // We have a pending operation that one ahead the last executed operation
                 self.current_state.broadcast_finality(o);
                 self.last_executed += 1;
-                info!("Peer {}: Executed operation {}! 🎉", self.my_index, n)
+                info!("Peer {}: Executed operation {}! 🎉", self.my_index, n);
+
+                self.create_checkpoint();
+                // TODO: Generate high-level signal on execution
                 // TODO: Persist execution
-                // TODO: Add checkpointing
             } else {
                 // No progress can be made so break out of the loop and push back popped item.
                 self.pending_committed.push((o, n));
                 break;
             }
         }
+        debug!("Peer {}: Pending commits {:?}.", self.my_index, self.pending_committed);
+    }
+
+    fn create_checkpoint(&mut self) {
+        // Only create checkpoints at certain intervals
+        if self.last_executed % self.checkpoint_interval != 0 {
+            return;
+        }
+
+        let current_state_digest = self.current_state.digest();
+        let checkpoint_event = PBFTEvent::Checkpoint {
+            from: self.my_index,
+            sequence_number: self.last_executed,
+            service_state_digest: current_state_digest.clone()
+        };
+        self.message_log.push(checkpoint_event.clone());
+        self.communication_proxy.broadcast(checkpoint_event);
+        debug!("Peer {}: Created checkpoint at {}.", self.my_index, self.last_executed);
+
+        // TODO: Revisit this and make more space efficient
+        self.checkpoints.push(Checkpoint {
+            sequence_number: self.last_executed,
+            service_state: self.current_state.clone()
+        });
+
+        self.collect_garbage(self.last_executed, current_state_digest);
     }
 
     fn process_checkpoint(&mut self, from: PeerIndex, sequence_number: SequenceNumber, service_state_digest: DigestResult) {
-        unimplemented!();
+        if !self.is_sequence_number_in_window(sequence_number) {
+            debug!("Peer {}: Ignoring checkpoint at {} because message log is too full.", self.my_index, sequence_number);
+        }
+
+        self.message_log.push(PBFTEvent::Checkpoint {
+            from,
+            sequence_number,
+            service_state_digest: service_state_digest.clone()
+        });
+        debug!("Peer {}: Received checkpoint at {}.", self.my_index, self.last_executed);
+        self.collect_garbage(sequence_number, service_state_digest);
     }
+
+    fn collect_garbage(&mut self, checkpoint_sequence_number: SequenceNumber, service_state_digest: DigestResult) {
+        let certificate_size = self.message_log.iter()
+            .filter(|e| {
+                if let PBFTEvent::Checkpoint {
+                    sequence_number: other_sequence_number,
+                    service_state_digest: other_service_state_digest,
+                    ..
+                } = e {
+                    (&checkpoint_sequence_number, &service_state_digest) == (other_sequence_number, other_service_state_digest)
+                } else {
+                    false
+                }
+            })
+            .map(|e| {
+                if let PBFTEvent::Checkpoint { from, .. } = e {
+                    return *from;
+                }
+                panic!("Impossible case.")
+            })
+            .collect::<HashSet<PeerIndex>>()
+            .len();
+
+        if (certificate_size as PeerIndex) < self.quorum_size() {
+            debug!("Peer {}: Cannot collect garbage because quorum has not been reached on checkpoint {}", self.my_index, checkpoint_sequence_number);
+            return;
+        }
+        // TODO: Checkpoint has been stabilized. Record it.
+
+        self.checkpoints.retain(|c| c.sequence_number >= checkpoint_sequence_number);
+        // TODO: Investigate why PBFT paper does not only look at sequence number for garbage but also digest
+        // This does not make sense because checkpoint digest is on the service state where as digest in
+        // Preprepare, prepare, and commit have digest over client requests. Exposition in section 4.4
+        // even says "replica discards all entries in its log with sequence numbers less than or equal to n".
+        //
+        // My instinct is that clearing by sequence number only is safe. Achieving quorum on the checkpoint
+        // means a quorum has committed and executed all messages up to checkpoint_sequence_number.
+        // Messages up to checkpoint_sequence_number are irreversible and so having messages the same
+        // or different from the finalized messages are garbage anyways. Any discrepancies from that
+        // of the checkpoint must be resolved using state transfer mechanism.
+        // TODO: Trigger state transfer if checkpoint is past the current last executed
+        self.message_log
+            .retain(|e| {
+                match e {
+                    PBFTEvent::Request(_) => {panic!("Request should not be in message log!")}
+                    PBFTEvent::PrePrepare { data, .. } => {data.sequence_number > checkpoint_sequence_number}
+                    PBFTEvent::Prepare { data, .. } => {data.sequence_number > checkpoint_sequence_number}
+                    PBFTEvent::Commit { data, .. } => {data.sequence_number > checkpoint_sequence_number}
+                    PBFTEvent::Checkpoint { sequence_number, .. } => {*sequence_number > checkpoint_sequence_number}
+                    PBFTEvent::Reply { .. } => {panic!("Reply should not be in message log!")}
+                }
+            });
+        self.prepared.retain(|data| data.sequence_number > checkpoint_sequence_number);
+        self.preprepared.retain(|data| data.sequence_number > checkpoint_sequence_number);
+
+        debug!("Peer {}: Collected garbage before checkpoint {}.", self.my_index, checkpoint_sequence_number);
+    }
+
     fn process_reply(&mut self, from: PeerIndex, sequence_number: SequenceNumber, execution_result: ()) {
         unimplemented!();
     }
