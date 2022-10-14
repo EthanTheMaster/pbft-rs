@@ -10,7 +10,7 @@ const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
 const TEST_DURATION_TIMEOUT_SEC: u64 = 10;
 
-fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
+pub fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
     where O: ServiceOperation
 {
     // Generate peer communication channels
@@ -68,6 +68,15 @@ fn test_max_fault() {
 
 #[test]
 fn test_quorum() {
+    // Let Q1 and Q2 be two quorums of size q.
+    // Let n and f be the number of replicas and the maximum number of allowable faults, respectively.
+    //
+    // |Q1 ∪ Q2| = |Q1| + |Q2| - |Q1 ∩ Q2| <= n
+    // => 2q - n <= |Q1 ∩ Q2| T
+    // To ensure safety, |Q1 ∩ Q2| >= f + 1 so that the intersection always contains some correct replica
+    //  If 2q-n >= f + 1, then safety is guaranteed.
+    //
+    // To ensure liveliness, q <= n - f otherwise quorum can never be achieved if all f processors crash
     let n: PeerIndex = 2;
     let network = setup_mock_network::<String>(n as usize);
     let pbft = network.get(0).unwrap();
@@ -155,3 +164,8 @@ async fn test_normal_operation() {
     }));
     join_all(tests).await;
 }
+
+// TODO: Test out of order commits
+// TODO: Test checkpointing
+// TODO: Test byzantine primary sending different preprepare
+// TODO: Test byzantine primary sending prepare

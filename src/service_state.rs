@@ -1,4 +1,6 @@
-use crate::kernel::{Digestible, DigestResult, ServiceOperation};
+use std::collections::HashMap;
+use crate::kernel::{Digestible, DigestResult, PeerIndex, SequenceNumber, ServiceOperation};
+
 
 // High level representation of user service state
 // Records a sequence of operations to perform against a *deterministic* state machine
@@ -7,18 +9,54 @@ use crate::kernel::{Digestible, DigestResult, ServiceOperation};
 pub struct ServiceState<O>
     where O: ServiceOperation
 {
+    // List of items awaiting to be placed into the log ... this is internal
+    // and should not be reflected in the digest which is based on the finalized log!
+    buffer: HashMap<usize, O>,
     log: Vec<O>,
+}
+
+// Used to aid in state transfer
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStateSummary {
+    pub log_length: usize,
+    pub log_digest: DigestResult
 }
 
 impl<O> ServiceState<O>
     where O: ServiceOperation
 {
     pub fn broadcast_finality(&mut self, op: O) {
+        // TODO: Check for noop operations
         self.log.push(op);
     }
 
     pub fn log(&self) -> &Vec<O> {
         &self.log
+    }
+
+    pub fn summarize(&self) -> ServiceStateSummary {
+        ServiceStateSummary {
+            log_length: self.log.len(),
+            log_digest: self.digest()
+        }
+    }
+
+    // It is sometimes the case that future operations are known but there is some
+    // gaps between the current state and the future operation. Queues up this operation
+    // for inclusion into the finalized log.
+    pub fn insert_operation(&mut self, index: usize, operation: O) {
+        // TODO: Check for noop operations
+        if index < self.log.len() {
+            // There is no point in inserting an already finalized operation
+            // TODO: Add warning if there is a mismatch! Safety issue!
+            return;
+        }
+        self.buffer.insert(index, operation);
+
+        while self.buffer.contains_key(&self.log.len()) {
+            let next_op = self.buffer.remove(&self.log.len()).unwrap();
+            self.broadcast_finality(next_op);
+        }
     }
 }
 
@@ -29,6 +67,7 @@ impl<O> Default for ServiceState<O>
 {
     fn default() -> Self {
         ServiceState {
+            buffer: Default::default(),
             log: Vec::new()
         }
     }
@@ -40,5 +79,36 @@ impl<O> Digestible for ServiceState<O>
     fn digest(&self) -> DigestResult {
         // TODO: Implement digest
         vec![]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum StateTransferRequest {
+    // Requester already knows the digest so responder must give a valid response matching this digest
+    ViewChangeDigestProof {
+        from: PeerIndex,
+        sequence_number: SequenceNumber,
+        digest: DigestResult,
+    },
+    ServiceStateItemProof {
+        from: PeerIndex,
+        log_length: usize, // Requester knows the service state digest at this point
+        log_item_index: usize // Request wants to know the operation at this point
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum StateTransferResponse<O>
+    where O: ServiceOperation
+{
+    ViewChangeDigestProof {
+        sequence_number: SequenceNumber,
+        operation: O
+    },
+    ServiceStateItemProof {
+        log_length: usize,
+        log_item_index: usize,
+        operation: O,
+        merkle_proof: Vec<DigestResult>
     }
 }

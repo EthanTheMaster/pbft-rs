@@ -4,10 +4,11 @@ use crate::kernel::{PBFTEvent, Peer, PeerId, PeerIndex, ServiceOperation};
 
 type SignatureResult = Vec<u8>;
 
+#[derive(Clone, Debug)]
 pub struct WrappedPBFTEvent<O>
     where O: ServiceOperation
 {
-    event: PBFTEvent<O>,
+    pub event: PBFTEvent<O>,
     from: PeerId,
     signature: Option<SignatureResult>,
 }
@@ -15,7 +16,7 @@ pub struct WrappedPBFTEvent<O>
 impl<O> WrappedPBFTEvent<O>
     where O: ServiceOperation
 {
-    pub fn validate(self, _peer: &Peer) -> bool {
+    pub fn is_valid(&self) -> bool {
         // TODO: Add real signature validation
         true
     }
@@ -57,7 +58,7 @@ impl<O> CommunicationProxy<O>
         }
     }
 
-    pub async fn recv_event(&mut self) -> PBFTEvent<O> {
+    pub async fn recv_event(&mut self) -> WrappedPBFTEvent<O> {
         match self.receiver_multiplexer.recv().await {
             None => {
                 //TODO: Figure out recovery
@@ -66,21 +67,24 @@ impl<O> CommunicationProxy<O>
             Some(e) => {
                 //TODO: Add signature validation
                 //TODO: Validate from components (Match PeerId with PeerIndex)
-                e.event
+                e
             }
+        }
+    }
+
+    pub fn wrap(&self, event: &PBFTEvent<O>) -> WrappedPBFTEvent<O> {
+        // TODO: Compute digital signature
+        WrappedPBFTEvent {
+            event: event.clone(),
+            from: "".to_string(),
+            signature: None,
         }
     }
 
     pub fn broadcast(&self, event: PBFTEvent<O>) {
         for (p, s) in self.peer_db.values() {
-            // TODO: Compute digital signature
-            let wrapped_msg = WrappedPBFTEvent {
-                event: event.clone(),
-                from: "".to_string(),
-                signature: None,
-            };
             // TODO: Handle send error
-            let _ = s.send(wrapped_msg);
+            let _ = s.send(self.wrap(&event));
         }
     }
 
@@ -91,14 +95,8 @@ impl<O> CommunicationProxy<O>
         let peer = self.indexed_participants.get(to as usize).unwrap();
         let sender = &self.peer_db.get(&peer.id).unwrap().1;
 
-        // TODO: Compute digital signature
-        let wrapped_msg = WrappedPBFTEvent {
-            event: event.clone(),
-            from: "".to_string(),
-            signature: None,
-        };
         // TODO: Handle send error
-        let _ = sender.send(wrapped_msg);
+        let _ = sender.send(self.wrap(&event));
     }
 
     pub fn num_peers(&self) -> usize {
