@@ -67,18 +67,18 @@ impl<T> ServiceOperation for T
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PrepTriple {
-    sequence_number: SequenceNumber,
-    digest: DigestResult,
-    view: ViewstampId,
+    pub sequence_number: SequenceNumber,
+    pub digest: DigestResult,
+    pub view: ViewstampId,
 }
 
 #[derive(Clone, Debug)]
 pub struct RequestPayload<O>
     where O: ServiceOperation
 {
-    op: O,
+    pub op: O,
     // TODO: Validate this field
-    op_digest: DigestResult,
+    pub op_digest: DigestResult,
 }
 
 impl<O> RequestPayload<O>
@@ -349,7 +349,7 @@ impl<O> PBFTState<O>
         self.primary(self.view) == participant_index
     }
 
-    fn log_low_mark(&self) -> SequenceNumber {
+    pub fn log_low_mark(&self) -> SequenceNumber {
         self.checkpoints.iter().map(|c| {
             c.sequence_number
         }).min().unwrap_or(0)
@@ -733,12 +733,13 @@ impl<O> PBFTState<O>
         }
 
         let current_state_summary = self.current_state.summarize();
+        let data = CheckpointSummary {
+            sequence_number: self.last_executed,
+            service_state_summary: current_state_summary,
+        };
         let checkpoint_event = PBFTEvent::Checkpoint {
             from: self.my_index,
-            data: CheckpointSummary {
-                sequence_number: self.last_executed,
-                service_state_summary: current_state_summary.clone(),
-            },
+            data: data.clone()
         };
         self.message_log.push(checkpoint_event.clone());
         self.communication_proxy.broadcast(checkpoint_event);
@@ -750,7 +751,7 @@ impl<O> PBFTState<O>
             service_state: self.current_state.clone(),
         });
 
-        self.collect_garbage(self.last_executed, current_state_summary.log_digest);
+        self.collect_garbage(&data);
     }
 
     fn process_checkpoint(&mut self, from: PeerIndex, data: CheckpointSummary) {
@@ -766,14 +767,16 @@ impl<O> PBFTState<O>
             },
         });
         debug!("Peer {}: Received checkpoint at {}.", self.my_index, self.last_executed);
-        self.collect_garbage(data.sequence_number, data.service_state_summary.log_digest);
+        self.collect_garbage(&data);
     }
 
-    fn collect_garbage(&mut self, checkpoint_sequence_number: SequenceNumber, service_state_digest: DigestResult) {
+    fn collect_garbage(&mut self, checkpoint_summary: &CheckpointSummary) {
+        let checkpoint_sequence_number = checkpoint_summary.sequence_number;
+        let service_state_digest = &checkpoint_summary.service_state_summary.log_digest;
         let certificate_size = self.message_log.iter()
             .filter(|e| {
                 if let PBFTEvent::Checkpoint { data, .. } = e {
-                    (&checkpoint_sequence_number, &service_state_digest) == (&data.sequence_number, &data.service_state_summary.log_digest)
+                    (&checkpoint_sequence_number, service_state_digest) == (&data.sequence_number, &data.service_state_summary.log_digest)
                 } else {
                     false
                 }
@@ -793,8 +796,12 @@ impl<O> PBFTState<O>
         }
         // TODO: Checkpoint has been stabilized. Record it.
 
+        // Attempt to synchronize up to the stabilized checkpoint
+        if checkpoint_sequence_number > self.last_executed {
+            self.synchronize_up_to_checkpoint(&checkpoint_summary);
+        }
+
         self.checkpoints.retain(|c| c.sequence_number >= checkpoint_sequence_number);
-        // TODO: Trigger state transfer if checkpoint is past the current last executed
         self.message_log
             .retain(|e| {
                 match e {
@@ -817,7 +824,8 @@ impl<O> PBFTState<O>
         self.preprepared.retain(|n, _| *n > checkpoint_sequence_number);
 
         let log_length = self.current_state().log().len();
-        self.known_service_state_digests.retain(|n, _| *n > log_length);
+        self.known_service_state_digests.retain(|l, _| *l > log_length);
+        self.requested_digests.retain(|(n, _), _| *n >= checkpoint_sequence_number);
 
         debug!("Peer {}: Collected garbage before checkpoint {}.", self.my_index, checkpoint_sequence_number);
 
@@ -829,6 +837,13 @@ impl<O> PBFTState<O>
     }
 
     pub fn change_view(&mut self, jump_size: ViewstampId) {
+        if jump_size == 0 {
+            // View changes should be strictly increasing and doing a jump size of 0
+            // would negatively impact liveliness.
+            warn!("Ignoring view change with jump size 0!");
+            return;
+        }
+
         let new_view = self.view + jump_size;
         debug!("Peer {}: Starting a view change: view {} -> {}.", self.my_index, self.view, new_view);
         self.is_view_active = false;
@@ -1034,6 +1049,18 @@ impl<O> PBFTState<O>
 
         let view_changes_iter = data.view_change_proofs.iter().map(convert_to_view_change);
 
+        let num_viewchangers = view_changes_iter.clone()
+            .map(|change| change.from)
+            .collect::<HashSet<PeerIndex>>()
+            .len();
+
+        if num_viewchangers < data.view_change_proofs.len() {
+            // This check probably does not affect safety of view change protocol but it is a good sanity check to include.
+            // Nobody should be submitting two different view change.
+            info!("Peer {}: Dropping new view (view = {}) from peer {} who included a double voter!.", self.my_index, data.view, data.from);
+            return;
+        }
+
         // Validate selected checkpoint
         if !self.is_valid_selected_checkpoint(view_changes_iter.clone(), &data.selected_checkpoint) {
             info!("Peer {}: Dropping new view (view = {}) from peer {} with invalid log low mark.", self.my_index, data.view, data.from);
@@ -1108,7 +1135,7 @@ impl<O> PBFTState<O>
             return;
         }
         if self.new_view_log.get(&self.view).is_none() {
-            // Can't view change
+            // Can't view change. No valid new view message has been received for this view
             return;
         }
 
@@ -1116,16 +1143,12 @@ impl<O> PBFTState<O>
         let h = self.log_low_mark();
         if h < new_view.selected_checkpoint.sequence_number {
             debug!("Peer {}: Cannot view change because log low mark is behind.", self.my_index);
-            // Attempt to synchronize up to the checkpoint
-            let summary = &new_view.selected_checkpoint.service_state_summary;
-            let checkpoint_number = new_view.selected_checkpoint.sequence_number;
-            self.known_service_state_digests.insert(summary.log_length, (checkpoint_number, summary.log_digest.clone()));
-            self.synchronize_up_to_checkpoint(&new_view.selected_checkpoint.service_state_summary.clone());
+            // Attempt to synchronize up to the new view selected checkpoint
+            self.synchronize_up_to_checkpoint(&new_view.selected_checkpoint.clone());
             return;
         }
         debug!("Peer {}: Synchronized up to checkpoint for view change!.", self.my_index);
 
-        let mut is_synchronized = true;
         for selected_message in new_view.selected_messages.iter() {
             match selected_message {
                 None => {
@@ -1136,13 +1159,15 @@ impl<O> PBFTState<O>
                     match self.find_op_with_digest(&selected_message.digest) {
                         None => {
                             // No such message has been found attempt to synchronize
-                            is_synchronized = false;
                             self.requested_digests.insert((selected_message.sequence_number, new_view.view), selected_message.digest.clone());
                             self.communication_proxy.broadcast(PBFTEvent::StateTransferRequest(StateTransferRequest::ViewChangeDigestProof {
                                 from: self.my_index,
                                 sequence_number: selected_message.sequence_number,
                                 digest: selected_message.digest.clone(),
-                            }))
+                            }));
+                            // TODO: Improve this to obtain many proofs in parallel without generating a lot of traffic
+                            // Exit because the replica is not synchronized on the digests
+                            return;
                         },
                         Some(op) => {
                             // Check that the message has been prepared and prepared in this view
@@ -1185,10 +1210,6 @@ impl<O> PBFTState<O>
                     }
                 }
             }
-        }
-        if !is_synchronized {
-            // Cannot change views because the replica is not up to date to enter normal operations
-            return;
         }
         debug!("Peer {}: Synchronized! Moving into the new view...", self.my_index);
         // All non noop operations have been preprepared and prepared (if applicable).
@@ -1248,6 +1269,7 @@ impl<O> PBFTState<O>
 
         // We just moved into a new view so trash all data less than the current one.
         self.new_view_log.retain(|v, _| *v > self.view);
+        self.requested_digests = Default::default();
     }
 
     fn is_valid_selected_checkpoint<'a, I: Iterator<Item=&'a ViewChange> + Clone>(&self, view_changes: I, candidate: &CheckpointSummary) -> bool {
@@ -1332,13 +1354,18 @@ impl<O> PBFTState<O>
         }
     }
 
-    fn synchronize_up_to_checkpoint(&mut self, checkpoint_summary: &ServiceStateSummary) {
+    fn synchronize_up_to_checkpoint(&mut self, checkpoint_summary: &CheckpointSummary) {
         // TODO: Do less naive synchronization
         let current_log_length = self.current_state.log().len();
-        for n in current_log_length + 1..=checkpoint_summary.log_length {
+        self.known_service_state_digests.insert(
+            checkpoint_summary.service_state_summary.log_length,
+            (checkpoint_summary.sequence_number, checkpoint_summary.service_state_summary.log_digest.clone())
+        );
+
+        for n in current_log_length..checkpoint_summary.service_state_summary.log_length {
             self.communication_proxy.broadcast(PBFTEvent::StateTransferRequest(StateTransferRequest::ServiceStateItemProof {
                 from: self.my_index,
-                log_length: checkpoint_summary.log_length,
+                log_length: checkpoint_summary.service_state_summary.log_length,
                 log_item_index: n,
             }))
         }
@@ -1384,12 +1411,14 @@ impl<O> PBFTState<O>
                         return;
                     }
 
-                    if !self.is_view_active && self.find_op_with_digest(digest).is_none() {
-                        // The response comes back while this replica is synchronizing with other for view change
-                        // and this replica does not know the operation associated with the digest.
-                        //
-                        // Perhaps multiple replicas responding back with an answer and we don't want to keep adding
-                        // preprepares and prepares.
+                    // In the current view, this replica attempted to resolve the operation associated
+                    // with a digest. If the replica already has in its record the corresponding operation
+                    // there is no point in prepreparing/preparing this newly found operation. This
+                    // also prevents spamming the message log with duplicate operations.
+                    //
+                    // This simply records the newly found operation in the message log so that it can
+                    // be found in the future.
+                    if self.find_op_with_digest(digest).is_none() {
                         let data = PrepTriple {
                             sequence_number,
                             digest: digest.clone(),
@@ -1404,14 +1433,21 @@ impl<O> PBFTState<O>
                         if !self.is_primary(self.my_index) {
                             let prepare = PBFTEvent::Prepare {
                                 from: self.my_index,
-                                data,
+                                data: data.clone(),
                             };
                             self.message_log.push(prepare.clone());
                             self.communication_proxy.broadcast(prepare);
                         }
 
-                        // Enough information may have accumulated to perform view change
-                        self.attempt_view_change();
+                        if !self.is_view_active {
+                            // The response comes back while this replica is synchronizing with other for view change
+                            // and this replica does not know the operation associated with the digest.
+                            //
+                            // Enough information may have accumulated to perform view change
+                            self.attempt_view_change();
+                        } else {
+                            self.attempt_commit_send(&data);
+                        }
                     }
                 }
             }
@@ -1419,13 +1455,18 @@ impl<O> PBFTState<O>
                 if let Some((checkpoint_number, service_state_digest)) = self.known_service_state_digests.get(&log_length) {
                     // TODO: Actually validate the proof and index again length
                     self.current_state.insert_operation(log_item_index, operation);
-                    // Immediately after inserting this operation we synchronized the service state up to a known checkpoint
-                    if self.current_state.log().len() == log_length {
-                        self.last_executed = *checkpoint_number;
-                        self.create_checkpoint();
-                        // Enough information may have accumulated to perform view change
-                        self.attempt_view_change();
+                }
+                // Immediately after inserting this operation we synchronized the service state up to a known checkpoint
+                if let Some((checkpoint_number, _)) = self.known_service_state_digests.get(&self.current_state.log().len()) {
+                    if self.last_executed >= *checkpoint_number {
+                        // For safety ensure that we are moving forward in the sequence number
+                        return;
                     }
+
+                    self.last_executed = *checkpoint_number;
+                    self.create_checkpoint();
+                    // Enough information may have accumulated to perform view change
+                    self.attempt_view_change();
                 }
             }
         }

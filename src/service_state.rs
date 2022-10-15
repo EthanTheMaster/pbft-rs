@@ -9,6 +9,8 @@ use crate::kernel::{Digestible, DigestResult, PeerIndex, SequenceNumber, Service
 pub struct ServiceState<O>
     where O: ServiceOperation
 {
+    // Save noop digest for quick reference
+    noop_digest: DigestResult,
     // List of items awaiting to be placed into the log ... this is internal
     // and should not be reflected in the digest which is based on the finalized log!
     buffer: HashMap<usize, O>,
@@ -26,7 +28,11 @@ impl<O> ServiceState<O>
     where O: ServiceOperation
 {
     pub fn broadcast_finality(&mut self, op: O) {
-        // TODO: Check for noop operations
+        let op_digest = op.digest();
+        if op_digest == self.noop_digest {
+            // Don't process noops
+            return;
+        }
         self.log.push(op);
     }
 
@@ -67,6 +73,7 @@ impl<O> Default for ServiceState<O>
 {
     fn default() -> Self {
         ServiceState {
+            noop_digest: O::noop().digest(),
             buffer: Default::default(),
             log: Vec::new()
         }
