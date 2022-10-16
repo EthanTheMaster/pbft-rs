@@ -10,9 +10,6 @@ use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferReque
 // Aliasing away concrete types to make
 // possible refactors easier
 // Index of peer in total ordering
-pub type ClientId = String;
-pub type ClientRequestTimestamp = u64;
-
 pub type ViewstampId = u64;
 pub type SequenceNumber = u64;
 pub type DigestResult = Vec<u8>;
@@ -28,18 +25,6 @@ pub trait Digestible {
 pub trait NoOp {
     // Returns element representing no operation
     fn noop() -> Self;
-}
-
-impl Digestible for String {
-    fn digest(&self) -> DigestResult {
-        self.as_bytes().to_vec()
-    }
-}
-
-impl NoOp for String {
-    fn noop() -> Self {
-        "".to_string()
-    }
 }
 
 // Alias traits required of service operations being replicated
@@ -97,8 +82,8 @@ pub struct ViewChange {
     log_low_mark: SequenceNumber,
     checkpoints: Vec<CheckpointSummary>,
     // P and Q sets
-    prepared: HashMap<SequenceNumber, PrepTriple>,
-    preprepared: HashMap<SequenceNumber, HashMap<DigestResult, ViewstampId>>,
+    prepared: HashSet<PrepTriple>,
+    preprepared: HashSet<PrepTriple>
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,12 +123,6 @@ pub enum PBFTEvent<O>
     Checkpoint {
         from: PeerIndex,
         data: CheckpointSummary,
-    },
-    Reply {
-        from: PeerIndex,
-        sequence_number: SequenceNumber,
-        // TODO: Add logic to alert system that message was just committed
-        execution_result: (),
     },
     ViewChange(ViewChange),
     NewView(NewView<O>),
@@ -288,9 +267,6 @@ impl<O> PBFTState<O>
             }
             PBFTEvent::Checkpoint { from, data } => {
                 self.process_checkpoint(from, data);
-            }
-            PBFTEvent::Reply { from, sequence_number, execution_result } => {
-                self.process_reply(from, sequence_number, execution_result);
             }
             PBFTEvent::ViewChange(_) => {
                 self.process_view_change(wrapped_event);
@@ -787,7 +763,7 @@ impl<O> PBFTState<O>
 
         // Attempt to synchronize up to the stabilized checkpoint
         if checkpoint_sequence_number > self.last_executed {
-            self.synchronize_up_to_checkpoint(&checkpoint_summary);
+            self.synchronize_up_to_checkpoint(checkpoint_summary);
         }
 
         self.checkpoints.retain(|c| c.sequence_number >= checkpoint_sequence_number);
@@ -800,7 +776,6 @@ impl<O> PBFTState<O>
                     PBFTEvent::Prepare { data, .. } => { data.sequence_number > checkpoint_sequence_number }
                     PBFTEvent::Commit { data, .. } => { data.sequence_number > checkpoint_sequence_number }
                     PBFTEvent::Checkpoint { data, .. } => { data.sequence_number > checkpoint_sequence_number }
-                    PBFTEvent::Reply { .. } => { unimplemented!() }
                     // View change
                     PBFTEvent::ViewChange(_) => { panic!("ViewChange should not be in the message log!") }
                     PBFTEvent::NewView(_) => { panic!("NewView should not be in the message log!") }
@@ -819,10 +794,6 @@ impl<O> PBFTState<O>
         debug!("Peer {}: Collected garbage before checkpoint {}.", self.my_index, checkpoint_sequence_number);
 
         // TODO: Clean up state transfer book keeping
-    }
-
-    fn process_reply(&mut self, from: PeerIndex, sequence_number: SequenceNumber, execution_result: ()) {
-        unimplemented!();
     }
 
     pub fn change_view(&mut self, jump_size: ViewstampId) {
@@ -846,13 +817,27 @@ impl<O> PBFTState<O>
                 }
             })
             .collect();
+
+        // Assemble the prepared and preprepared indices into a set of tuples for packaging on the network
+        let prepared = self.prepared.values().cloned().collect();
+        let preprepared = self.preprepared.iter()
+            .flat_map(|(n, digest_map)| {
+                digest_map.iter().map(|(d, v)| {
+                    PrepTriple {
+                        sequence_number: *n,
+                        digest: d.clone(),
+                        view: *v
+                    }
+                })
+            })
+            .collect();
         let view_change = PBFTEvent::ViewChange(ViewChange {
             from: self.my_index,
             view: new_view,
             log_low_mark: self.log_low_mark(),
             checkpoints,
-            prepared: self.prepared.clone(),
-            preprepared: self.preprepared.clone(),
+            prepared,
+            preprepared
         });
 
         self.process_view_change(self.communication_proxy.wrap(&view_change));
@@ -907,20 +892,20 @@ impl<O> PBFTState<O>
         }
 
         // Check that the data in view change is correct
-        if !data.prepared.iter().all(|(n, other_data)| {
-            other_data.view < data.view
-                && data.log_low_mark < *n
-                && *n <= data.log_low_mark + self.sequence_window_length
+        if !data.prepared.iter().all(|prep| {
+            let (n, v) = (prep.sequence_number, prep.view);
+            v < data.view
+                && data.log_low_mark < n
+                && n <= data.log_low_mark + self.sequence_window_length
         }) {
             debug!("Peer {}: Received view change from peer {} with malformed prepared field!", self.my_index, data.from);
             return;
         }
-        if !data.preprepared.iter().all(|(n, digest_map)| {
-            data.log_low_mark < *n
-                && *n <= data.log_low_mark + self.sequence_window_length
-                && digest_map.iter().all(|(_, other_view)| {
-                *other_view < data.view
-            })
+        if !data.preprepared.iter().all(|prep| {
+            let (n, v) = (prep.sequence_number, prep.view);
+            v < data.view
+                && data.log_low_mark < n
+                && n <= data.log_low_mark + self.sequence_window_length
         }) {
             debug!("Peer {}: Received view change from peer {} with malformed preprepared field!", self.my_index, data.from);
             return;
@@ -959,7 +944,11 @@ impl<O> PBFTState<O>
             // Attempt to select any previously committed message at sequence number n
             // Look at all prepared messages at the sequence number n
             let committed_msg = view_changes_iter.clone()
-                .filter_map(|change| change.prepared.get(&n))
+                .flat_map(|change| {
+                    // Get all prepared messages with sequence number at the target n
+                    change.prepared.iter()
+                        .filter(|prep| prep.sequence_number == n)
+                })
                 .find(|candidate| {
                     self.is_justified_by_a1(view_changes_iter.clone(), candidate)
                         && self.is_justified_by_a2(view_changes_iter.clone(), candidate)
@@ -1086,9 +1075,7 @@ impl<O> PBFTState<O>
 
                     let chosen_from_prepared = view_changes_iter.clone()
                         .any(|change| {
-                            change.prepared
-                                .get(&n)
-                                .map_or(false, |other_prep| other_prep == chosen_prep)
+                            change.prepared.contains(chosen_prep)
                         });
 
                     if !chosen_from_prepared {
@@ -1282,14 +1269,16 @@ impl<O> PBFTState<O>
 
     fn is_justified_by_a1<'a, I: Iterator<Item=&'a ViewChange>>(&self, view_changes: I, candidate: &PrepTriple) -> bool {
         let n = candidate.sequence_number;
+        let v = candidate.view;
+
         // Fig 4 Condition A1 of PBFT paper
         view_changes
             .filter(|change| {
                 change.log_low_mark < n
-                    && change.prepared.get(&n)
-                    .map_or(true, |other_prep| { // Universal qualification over an empty set is vacuously true
-                        other_prep.view < candidate.view
-                            || (other_prep.view, &other_prep.digest) == (candidate.view, &candidate.digest)
+                    && change.prepared.iter()
+                    .filter(|prep| prep.sequence_number == n)
+                    .all(|other| {
+                        other.view < v || (other.view, &other.digest) == (v, &candidate.digest)
                     })
             })
             .map(|change| change.from)
@@ -1302,10 +1291,11 @@ impl<O> PBFTState<O>
         // Fig 4 Condition A2 of PBFT paper
         view_changes
             .filter(|change| {
-                change.preprepared
-                    .get(&n)
-                    .and_then(|digest_map| digest_map.get(&candidate.digest))
-                    .map_or(false, |other_view| *other_view >= candidate.view)
+                change.preprepared.iter()
+                    .any(|other| {
+                        (other.sequence_number, &other.digest) == (n, &candidate.digest)
+                            && other.view >= candidate.view
+                    })
             })
             .map(|change| change.from)
             .collect::<HashSet<PeerIndex>>()
@@ -1318,7 +1308,7 @@ impl<O> PBFTState<O>
         view_changes
             .filter(|change| {
                 change.log_low_mark < n
-                    && change.prepared.get(&n).is_none()
+                    && change.prepared.iter().all(|other| other.sequence_number != n)
             })
             .map(|change| change.from)
             .collect::<HashSet<PeerIndex>>()

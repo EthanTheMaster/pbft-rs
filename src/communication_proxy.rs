@@ -66,7 +66,7 @@ async fn listen_for_events<O>(hostname: String, proxy_sender: UnboundedSender<Wr
 async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEvent<O>>
     where O: ServiceOperation + Serialize + std::marker::Send + 'static
 {
-    let (peer_sender, mut peer_receiver) = unbounded_channel();
+    let (peer_sender, mut peer_receiver): (UnboundedSender<WrappedPBFTEvent<O>>, UnboundedReceiver<WrappedPBFTEvent<O>>) = unbounded_channel();
     tokio::spawn(async move {
         let mut last_sent_message: Option<Value> = None;
         loop {
@@ -95,7 +95,7 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
             }
 
             while let Some(msg) = peer_receiver.recv().await {
-                let json = serde_json::to_value(msg);
+                let json = serde_json::to_value(msg.clone());
                 match json {
                     Ok(v) => {
                         last_sent_message = Some(v.clone());
@@ -105,8 +105,10 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
                             break;
                         }
                     }
-                    Err(_) => {
-                        warn!("Failed to serialize message!");
+                    Err(e) => {
+                        // This is a critical issue where it is not possible to send a PBFT event
+                        // over the network.
+                        panic!("Failed to serialize message! {:?}\n{:?}", e, msg);
                     }
                 }
             }
@@ -183,7 +185,7 @@ impl<O> CommunicationProxy<O>
     }
 
     pub async fn recv_event(&mut self) -> Option<WrappedPBFTEvent<O>> {
-        return self.receiver_multiplexer.recv().await;
+        self.receiver_multiplexer.recv().await
     }
 
     pub fn wrap(&self, event: &PBFTEvent<O>) -> WrappedPBFTEvent<O> {
