@@ -1,78 +1,77 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use futures::future::join_all;
-use tokio::sync::mpsc::unbounded_channel;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
-use pbft_library::communication_proxy::CommunicationProxy;
-use pbft_library::kernel::{Digestible, PBFTEvent, PBFTState, Peer, PeerIndex, PrepTriple, RequestPayload, ServiceOperation};
+use pbft_library::communication_proxy::{CommunicationProxy, Peer, PeerIndex};
+use pbft_library::kernel::{Digestible, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
 
 // The amount of time it takes to receive a request before it is determined that there are no
 // more messages.
-const NETWORK_QUIESCENT_TIMEOUT_SEC: u64 = 1;
+const NETWORK_QUIESCENT_TIMEOUT_SEC: u64 = 3;
 
-pub fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
-    where O: ServiceOperation
+static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
+
+pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
+    where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
     // Generate peer communication channels
     let mut peers = Vec::new();
-    let mut txs = Vec::new();
-    let mut rxs = Vec::new();
     for i in 0..n {
+        let port = NEXT_PORT_AVAILABLE.fetch_add(1, Ordering::SeqCst);
         peers.push(Peer {
             id: format!("Peer{}", i),
-            hostname: format!("Peer{}", i),
+            hostname: format!("127.0.0.1:{}", port),
         });
-        let (tx, rx) = unbounded_channel();
-        txs.push(tx);
-        rxs.push(rx);
     }
 
     // Generate PBFT machines
     let mut res = Vec::new();
-    for (i, rx_i) in rxs.into_iter().enumerate() {
+    for i in 0..n {
         let mut peer_channels = Vec::new();
         for j in 0..n {
             // Peers are everybody except ourselves (i)
             if i != j {
-                let tx_j = txs.get(j).unwrap();
                 let peer_j = peers.get(j).unwrap();
-                peer_channels.push((peer_j.clone(), tx_j.clone()))
+                peer_channels.push(peer_j.clone())
             }
         }
 
-        let proxy = CommunicationProxy::new(peers[i].clone(), peer_channels, rx_i);
+        let proxy = CommunicationProxy::new(peers[i].clone(), peer_channels).await;
         res.push(PBFTState::new(proxy, SEQUENCE_WINDOW_LENGTH, CHECKPOINT_INTERVAL));
     }
 
     res
 }
 
-#[test]
-fn test_max_fault() {
-    let network = setup_mock_network::<String>(2);
+#[tokio::test]
+async fn test_max_fault() {
+    let network = setup_mock_network::<String>(2).await;
     let max_faults = network.get(0).unwrap().max_faults();
     assert_eq!(max_faults, 0, "Test no faults.");
 
-    let network = setup_mock_network::<String>(4);
+    let network = setup_mock_network::<String>(4).await;
     let max_faults = network.get(0).unwrap().max_faults();
     assert_eq!(max_faults, 1, "Test n = 3f + 1");
 
-    let network = setup_mock_network::<String>(14);
+    let network = setup_mock_network::<String>(14).await;
     let max_faults = network.get(0).unwrap().max_faults();
     assert_eq!(max_faults, 4, "Test n = 3f + 2");
 
-    let network = setup_mock_network::<String>(36);
+    let network = setup_mock_network::<String>(36).await;
     let max_faults = network.get(0).unwrap().max_faults();
     assert_eq!(max_faults, 11, "Test n = 3f + 3");
 }
 
-#[test]
-fn test_quorum() {
+#[tokio::test]
+async fn test_quorum() {
     // Let Q1 and Q2 be two quorums of size q.
     // Let n and f be the number of replicas and the maximum number of allowable faults, respectively.
     //
@@ -83,7 +82,7 @@ fn test_quorum() {
     //
     // To ensure liveliness, q <= n - f otherwise quorum can never be achieved if all f processors crash
     let n: PeerIndex = 2;
-    let network = setup_mock_network::<String>(n as usize);
+    let network = setup_mock_network::<String>(n as usize).await;
     let pbft = network.get(0).unwrap();
     let f = pbft.max_faults();
     let quorum = pbft.quorum_size();
@@ -91,7 +90,7 @@ fn test_quorum() {
     assert!(quorum <= n - f, "Test quorum liveliness for no faults");
 
     let n: PeerIndex = 4;
-    let network = setup_mock_network::<String>(n as usize);
+    let network = setup_mock_network::<String>(n as usize).await;
     let pbft = network.get(0).unwrap();
     let f = pbft.max_faults();
     let quorum = pbft.quorum_size();
@@ -99,7 +98,7 @@ fn test_quorum() {
     assert!(quorum <= n - f, "Test quorum liveliness for n = 3f + 1");
 
     let n: PeerIndex = 14;
-    let network = setup_mock_network::<String>(n as usize);
+    let network = setup_mock_network::<String>(n as usize).await;
     let pbft = network.get(0).unwrap();
     let f = pbft.max_faults();
     let quorum = pbft.quorum_size();
@@ -107,7 +106,7 @@ fn test_quorum() {
     assert!(quorum <= n - f, "Test quorum liveliness for n = 3f + 2");
 
     let n: PeerIndex = 36;
-    let network = setup_mock_network::<String>(n as usize);
+    let network = setup_mock_network::<String>(n as usize).await;
     let pbft = network.get(0).unwrap();
     let f = pbft.max_faults();
     let quorum = pbft.quorum_size();
@@ -118,7 +117,7 @@ fn test_quorum() {
 // Helper function to drive network until no more messages are sent
 type Kernels<O> = Vec<Arc<TokioMutex<PBFTState<O>>>>;
 async fn drive_until_quiescent<O>(network: &Kernels<O>, nonparticipants: HashSet<usize>)
-    where O: ServiceOperation + std::marker::Send + 'static
+    where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
     let mut handles = vec![];
     for (i, state) in network.iter().enumerate() {
@@ -150,7 +149,7 @@ fn convert_network_to_kernels<O: ServiceOperation>(network: Vec<PBFTState<O>>) -
 }
 
 async fn normal_operation_runner(n: usize) {
-    let network = setup_mock_network::<String>(n);
+    let network = setup_mock_network::<String>(n).await;
     let network = convert_network_to_kernels(network);
 
     // Create scopes to drop the tokio mutex
@@ -194,7 +193,7 @@ async fn test_normal_operation() {
 #[tokio::test]
 async fn test_out_of_order_commits() {
     let n = 4;
-    let network = setup_mock_network::<String>(n);
+    let network = setup_mock_network::<String>(n).await;
     let network = convert_network_to_kernels(network);
 
     // Create scope to drop the tokio mutex lock on the primary
@@ -234,7 +233,7 @@ async fn test_out_of_order_commits() {
 #[tokio::test]
 async fn test_checkpoint_garbage_collection() {
     let n = 4;
-    let network = setup_mock_network::<String>(n);
+    let network = setup_mock_network::<String>(n).await;
     let network = convert_network_to_kernels(network);
 
     let rounds = 5;
@@ -271,7 +270,9 @@ async fn test_checkpoint_garbage_collection() {
     }
 }
 
-async fn drain_receiver<O: ServiceOperation>(communication_proxy: &mut CommunicationProxy<O>) {
+async fn drain_receiver<O>(communication_proxy: &mut CommunicationProxy<O>)
+    where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
+{
     loop {
         let recv = communication_proxy.recv_event();
         let timeout_res = timeout(Duration::from_secs(NETWORK_QUIESCENT_TIMEOUT_SEC), recv).await;
@@ -284,7 +285,7 @@ async fn drain_receiver<O: ServiceOperation>(communication_proxy: &mut Communica
 #[tokio::test]
 async fn test_checkpoint_synchronization() {
     let n = 4;
-    let network = setup_mock_network::<String>(n);
+    let network = setup_mock_network::<String>(n).await;
     let mut network = convert_network_to_kernels(network);
 
     let rounds = 5;
@@ -339,7 +340,7 @@ async fn view_change_safety_runner(n: usize) {
     // Assume n >= 4 so some faults are allowed
     assert!(n >= 4);
 
-    let network = setup_mock_network::<String>(n);
+    let network = setup_mock_network::<String>(n).await;
     let network = convert_network_to_kernels(network);
     let f = {
         network.get(1).unwrap().lock().await.max_faults()

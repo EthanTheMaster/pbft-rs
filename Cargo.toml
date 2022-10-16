@@ -11,3 +11,11 @@ tokio-stream = "0.1.10"
 futures = "0.3.24"
 log = "0.4.17"
 simple_logger = "2.3.0"
+
+tokio-serde = { version = "0.8.0", features = ["json"] }
+tokio-util = { version = "0.7.4", features = ["codec"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.86"
+
+ed25519-compact = "2.0.2"
+sha3 = "0.10.5"

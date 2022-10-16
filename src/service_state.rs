@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use crate::kernel::{Digestible, DigestResult, PeerIndex, SequenceNumber, ServiceOperation};
+use crate::communication_proxy::PeerIndex;
+use crate::kernel::{Digestible, DigestResult, SequenceNumber, ServiceOperation};
+use serde::{Serialize, Deserialize};
 
 
 // High level representation of user service state
@@ -18,7 +20,7 @@ pub struct ServiceState<O>
 }
 
 // Used to aid in state transfer
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceStateSummary {
     pub log_length: usize,
     pub log_digest: DigestResult
@@ -89,7 +91,7 @@ impl<O> Digestible for ServiceState<O>
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StateTransferRequest {
     // Requester already knows the digest so responder must give a valid response matching this digest
     ViewChangeDigestProof {
@@ -104,7 +106,7 @@ pub enum StateTransferRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StateTransferResponse<O>
     where O: ServiceOperation
 {

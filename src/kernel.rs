@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use log::{debug, info, warn};
-use crate::communication_proxy::{CommunicationProxy, WrappedPBFTEvent};
+use crate::communication_proxy::{CommunicationProxy, PeerIndex, WrappedPBFTEvent};
+use serde::{Serialize, Deserialize};
+use serde::de::DeserializeOwned;
 
 use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferRequest, StateTransferResponse};
 
 // Aliasing away concrete types to make
 // possible refactors easier
-pub type PeerId = String;
-pub type PeerIndex = u64;
 // Index of peer in total ordering
 pub type ClientId = String;
 pub type ClientRequestTimestamp = u64;
@@ -16,22 +16,6 @@ pub type ClientRequestTimestamp = u64;
 pub type ViewstampId = u64;
 pub type SequenceNumber = u64;
 pub type DigestResult = Vec<u8>;
-
-#[derive(Clone)]
-pub struct Peer {
-    // TODO: Make id generic and sortable to assign total order to list of peers
-    pub id: PeerId,
-    pub hostname: String,
-    // TODO: Add fields for cryptographic keys
-}
-
-pub struct Configuration {
-    peers: Vec<Peer>,
-    // TODO: Add fields for cryptographic keys
-    // TODO: Add fields for timeout configuration
-    // TODO: Add checkpoint management and log compression parameters
-    // TODO: Add fields for configuring network listening
-}
 
 // Trait allowing cryptographic hash to be computed
 pub trait Digestible {
@@ -65,14 +49,14 @@ Clone + Debug + Digestible + NoOp {}
 impl<T> ServiceOperation for T
     where T: Clone + Debug + Digestible + NoOp {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct PrepTriple {
     pub sequence_number: SequenceNumber,
     pub digest: DigestResult,
     pub view: ViewstampId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestPayload<O>
     where O: ServiceOperation
 {
@@ -100,13 +84,13 @@ pub struct Checkpoint<O>
     service_state: ServiceState<O>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointSummary {
     sequence_number: SequenceNumber,
     service_state_summary: ServiceStateSummary,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewChange {
     from: PeerIndex,
     view: ViewstampId,
@@ -117,7 +101,7 @@ pub struct ViewChange {
     preprepared: HashMap<SequenceNumber, HashMap<DigestResult, ViewstampId>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewView<O>
     where O: ServiceOperation
 {
@@ -132,7 +116,7 @@ pub struct NewView<O>
     selected_messages: Vec<Option<PrepTriple>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PBFTEvent<O>
     where O: ServiceOperation
 {
@@ -229,7 +213,7 @@ pub struct PBFTState<O>
 }
 
 impl<O> PBFTState<O>
-    where O: ServiceOperation
+    where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
     pub fn new(
         communication_proxy: CommunicationProxy<O>,
@@ -284,6 +268,11 @@ impl<O> PBFTState<O>
     pub async fn step(&mut self) {
         // TODO: Add rebroadcast logic to subvert byzantine peer. Wrapped event has proof that byzantine peer sent message.
         let wrapped_event = self.communication_proxy.recv_event().await;
+        if wrapped_event.is_none() {
+            info!("Failed to read an event from communication proxy.");
+            return;
+        }
+        let wrapped_event = wrapped_event.unwrap();
         match wrapped_event.event {
             PBFTEvent::Request(payload) => {
                 self.process_request(payload);
