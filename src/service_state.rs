@@ -53,7 +53,10 @@ impl<O> ServiceState<O>
     // gaps between the current state and the future operation. Queues up this operation
     // for inclusion into the finalized log.
     pub fn insert_operation(&mut self, index: usize, operation: O) {
-        // TODO: Check for noop operations
+        if operation.digest() == self.noop_digest {
+            // Don't process noops
+            return;
+        }
         if index < self.log.len() {
             // There is no point in inserting an already finalized operation
             // TODO: Add warning if there is a mismatch! Safety issue!

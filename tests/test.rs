@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use ed25519_compact::{KeyPair, Seed};
 use futures::future::join_all;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Deserialize};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
-use pbft_library::communication_proxy::{CommunicationProxy, Peer, PeerIndex};
+use pbft_library::communication_proxy::{CommunicationProxy, Configuration, Peer, PeerIndex};
 use pbft_library::kernel::{Digestible, DigestResult, NoOp, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
 
 const CHECKPOINT_INTERVAL: u64 = 10;
@@ -17,6 +18,9 @@ const SEQUENCE_WINDOW_LENGTH: u64 = 20;
 // more messages.
 const NETWORK_QUIESCENT_TIMEOUT_SEC: u64 = 3;
 
+// Rust runs tests in parallel and we cannot have tests interfering with each other
+// Networks are mocked up and simulated replicas must be assigned an ip uninhabited by
+// another process. This ensures that replicas are assigned a unique ip during the test.
 static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -42,27 +46,36 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
 {
     // Generate peer communication channels
     let mut peers = Vec::new();
+    let mut secret_keys = Vec::new();
     for i in 0..n {
+        let signature_key_pair = KeyPair::from_seed(Seed::generate());
+        secret_keys.push(signature_key_pair.sk);
         let port = NEXT_PORT_AVAILABLE.fetch_add(1, Ordering::SeqCst);
         peers.push(Peer {
             id: format!("Peer{}", i),
             hostname: format!("127.0.0.1:{}", port),
+            signature_public_key: signature_key_pair.pk
         });
     }
 
     // Generate PBFT machines
     let mut res = Vec::new();
     for i in 0..n {
-        let mut peer_channels = Vec::new();
+        let mut peers_i = Vec::new();
         for j in 0..n {
             // Peers are everybody except ourselves (i)
             if i != j {
                 let peer_j = peers.get(j).unwrap();
-                peer_channels.push(peer_j.clone())
+                peers_i.push(peer_j.clone())
             }
         }
 
-        let proxy = CommunicationProxy::new(peers[i].clone(), peer_channels).await;
+        let configuration = Configuration {
+            peers: peers_i,
+            this_replica: peers.get(i).unwrap().clone(),
+            signature_secret_key: secret_keys.get(i).unwrap().clone()
+        };
+        let proxy = CommunicationProxy::new(configuration).await;
         res.push(PBFTState::new(proxy, SEQUENCE_WINDOW_LENGTH, CHECKPOINT_INTERVAL));
     }
 
@@ -193,12 +206,17 @@ async fn normal_operation_runner(n: usize) {
 }
 
 #[tokio::test]
-async fn test_normal_operation() {
+async fn test_normal_operation_mod1() {
     normal_operation_runner(4).await;
+}
+#[tokio::test]
+async fn test_normal_operation_mod2() {
     normal_operation_runner(14).await;
+}
+#[tokio::test]
+async fn test_normal_operation_mod0() {
     normal_operation_runner(36).await;
 }
-
 
 #[tokio::test]
 async fn test_out_of_order_commits() {
@@ -275,6 +293,7 @@ async fn test_checkpoint_garbage_collection() {
         }
 
         let state = state.lock().await;
+        println!("{}", state.log_low_mark());
         // Garbage collection should purge any old checkpoints
         assert!(state.log_low_mark() >= rounds*CHECKPOINT_INTERVAL, "Test Checkpoint Low Log Mark Update");
     }
@@ -367,7 +386,7 @@ async fn view_change_safety_runner(n: usize) {
         communication_proxy.broadcast(PBFTEvent::PrePrepare {
             from: 0,
             data: PrepTriple {
-                sequence_number: 3,
+                sequence_number: SEQUENCE_WINDOW_LENGTH - 1,
                 digest: msg.digest(),
                 view: 0
             },
@@ -398,8 +417,14 @@ async fn view_change_safety_runner(n: usize) {
 }
 
 #[tokio::test]
-async fn test_view_change_safety() {
+async fn test_view_change_safety_mod1() {
     view_change_safety_runner(4).await;
+}
+#[tokio::test]
+async fn test_view_change_safety_mod2() {
     view_change_safety_runner(5).await;
+}
+#[tokio::test]
+async fn test_view_change_safety_mod0() {
     view_change_safety_runner(6).await;
 }

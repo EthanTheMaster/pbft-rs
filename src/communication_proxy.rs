@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
+use ed25519_compact::{Noise, PublicKey, SecretKey, Signature};
 use futures::{SinkExt, TryStreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::kernel::{PBFTEvent, ServiceOperation};
 use serde::{Serialize, Deserialize};
@@ -11,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_serde::formats::SymmetricalJson;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use crate::service_state::StateTransferRequest;
 
 type SignatureResult = Vec<u8>;
 
@@ -21,25 +23,163 @@ pub struct Peer {
     // TODO: Make id generic and sortable to assign total order to list of peers
     pub id: PeerId,
     pub hostname: String,
-    // TODO: Add fields for cryptographic keys
+    pub signature_public_key: PublicKey
 }
 
 pub struct Configuration {
-    peers: Vec<Peer>,
-    // TODO: Add fields for cryptographic keys
+    pub peers: Vec<Peer>,
+    pub this_replica: Peer,
+    pub signature_secret_key: SecretKey
     // TODO: Add fields for timeout configuration
     // TODO: Add checkpoint management and log compression parameters
-    // TODO: Add fields for configuring network listening
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignedPayload {
+    pub from: PeerId,
+    pub serialized_event: String,
+    pub signature: SignatureResult
+}
+
+impl SignedPayload {
+    pub fn is_valid(&self, peer_public_key: &PublicKey) -> bool {
+        let signature = Signature::from_slice(self.signature.as_slice());
+        match signature {
+            Ok(signature) => {
+                peer_public_key.verify(self.serialized_event.as_bytes(), &signature).is_ok()
+            }
+            Err(_) => {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+// A wrapped PBFT event is a wrapper for a PBFT event that also includes
+// a proof showing that the contained event was indeed sent by the sender.
+//
+// Wrapping an event is an abstraction indicating that the wrapped event
+// has been validated for correctness.
+pub struct WrappedPBFTEvent<O>
+    where O: ServiceOperation
+{
+    witness: SignedPayload,
+    pub event: PBFTEvent<O>,
+}
+
+impl<O> WrappedPBFTEvent<O>
+    where O: ServiceOperation
+{
+    pub fn witness(&self) -> &SignedPayload {
+        &self.witness
+    }
+
+    // Signed payload could be adversarially chosen and needs to be thoroughly validated before converted into
+    // a wrapped event.
+    pub fn from_signed_payload<Op>(
+        payload: SignedPayload,
+        peer_db: &HashMap<PeerId, (PeerIndex, Peer)>
+    ) -> Result<WrappedPBFTEvent<Op>, String>
+        where Op: ServiceOperation + DeserializeOwned
+    {
+        let peer_public_key = &peer_db.get(&payload.from);
+        if peer_public_key.is_none() {
+            return Err(format!("Received signed payload from unknown peer. {:?}", payload));
+        }
+        let (peer_index, peer) = &peer_public_key.unwrap();
+        if !payload.is_valid(&peer.signature_public_key) {
+            return Err(format!("Received payload with invalid signature! {:?}", payload))
+        }
+
+        // Payload is valid ... attempt to deserialize it into an PBFTEvent
+        let event = serde_json::from_str::<PBFTEvent<Op>>(&payload.serialized_event);
+        if event.is_err() {
+            return Err(format!("Failed to deserialize payload event. {:?}", payload));
+        }
+
+        // Validate the contents of the event
+        let event = event.unwrap();
+        match &event {
+            PBFTEvent::Request(request) => {
+                if !request.is_valid() {
+                    return Err(format!("Request operation digest is not valid!. {:?}", event));
+                }
+            }
+            PBFTEvent::PrePrepare { from, data: _data, request } => {
+                if from != peer_index {
+                    return Err(format!("Preprepare and payload do not have matching sender. {:?}", event));
+                }
+                if !request.is_valid() {
+                    return Err(format!("Request operation digest is not valid!. {:?}", event));
+                }
+            }
+            PBFTEvent::Prepare { from, data: _data } => {
+                if from != peer_index {
+                    return Err(format!("Prepare and payload do not have matching sender. {:?}", event));
+                }
+            }
+            PBFTEvent::Commit { from, data: _data } => {
+                if from != peer_index {
+                    return Err(format!("Prepare and payload do not have matching sender. {:?}", event));
+                }
+            }
+            PBFTEvent::Checkpoint { from, data: _data } => {
+                if from != peer_index {
+                    return Err(format!("Prepare and payload do not have matching sender. {:?}", event));
+                }
+            }
+            PBFTEvent::ViewChange(change) => {
+                if &change.from != peer_index {
+                    return Err(format!("View change and payload do not have matching sender. {:?}", event));
+                }
+            }
+            PBFTEvent::NewView(new_view) => {
+                if &new_view.from != peer_index {
+                    return Err(format!("New view and payload do not have matching sender. {:?}", event));
+                }
+            }
+            PBFTEvent::StateTransferRequest(req) => {
+                match req {
+                    StateTransferRequest::ViewChangeDigestProof { from, sequence_number: _sequence_number, digest: _digest } => {
+                        if from != peer_index {
+                            return Err(format!("ViewChangeDigestProof and payload do not have matching sender. {:?}", event));
+                        }
+                    }
+                    StateTransferRequest::ServiceStateItemProof { from, log_length: _log_length, log_item_index: _log_item_index } => {
+                        if from != peer_index {
+                            return Err(format!("ServiceStateItemProof and payload do not have matching sender. {:?}", event));
+                        }
+                    }
+                }
+            }
+            PBFTEvent::StateTransferResponse(_) => {}
+        }
+
+        Ok(WrappedPBFTEvent {
+            witness: payload,
+            event
+        })
+    }
 }
 
 // Listens for incoming events and forwards them to the proxy sender
-async fn listen_for_events<O>(hostname: String, proxy_sender: UnboundedSender<WrappedPBFTEvent<O>>)
+async fn listen_for_events<O>(
+    hostname: String,
+    proxy_sender: UnboundedSender<WrappedPBFTEvent<O>>,
+    peer_db: HashMap<PeerId, (PeerIndex, Peer)>
+)
     where O: ServiceOperation + DeserializeOwned + std::marker::Send + 'static
 {
     let proxy_sender = proxy_sender.clone();
     let listener = TcpListener::bind(hostname.clone()).await.unwrap();
     info!("Listening on {}", hostname);
     loop {
+        if proxy_sender.is_closed() {
+            // Channel has been broken ... don't attempt to send data down this channel
+            break;
+        }
+
         let (socket, _) = listener.accept().await.unwrap();
 
         let length_delimited = FramedRead::new(socket, LengthDelimitedCodec::new());
@@ -47,14 +187,28 @@ async fn listen_for_events<O>(hostname: String, proxy_sender: UnboundedSender<Wr
         let mut deserialized = tokio_serde::SymmetricallyFramed::new(length_delimited, SymmetricalJson::<Value>::default());
 
         let proxy_sender = proxy_sender.clone();
+        let peer_db_clone = peer_db.clone();
         tokio::spawn(async move {
             while let Some(msg) = deserialized.try_next().await.unwrap() {
-                let event = serde_json::from_value::<WrappedPBFTEvent<O>>(msg);
-                if let Ok(event) = event {
-                    // Message was successfully read. Route this to the proxy receiver.
-                    let _ = proxy_sender.send(event);
-                    //TODO: Add signature validation
-                    //TODO: Validate from components (Match PeerId with PeerIndex)
+                let payload = serde_json::from_value::<SignedPayload>(msg);
+                if payload.is_err() {
+                    debug!("Failed to deserialize signed payload.");
+                    continue;
+                }
+                let payload = payload.unwrap();
+                match WrappedPBFTEvent::<O>::from_signed_payload(payload, &peer_db_clone) {
+                    Ok(e) => {
+                        let send = proxy_sender.send(e);
+                        if send.is_err() {
+                            // Channel has been broken
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        // The payload could not be validated
+                        info!("{}", err);
+                        continue;
+                    }
                 }
             }
         });
@@ -95,8 +249,8 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
             }
 
             while let Some(msg) = peer_receiver.recv().await {
-                let json = serde_json::to_value(msg.clone());
-                match json {
+                let signed_payload_json = serde_json::to_value(msg.witness());
+                match signed_payload_json {
                     Ok(v) => {
                         last_sent_message = Some(v.clone());
                         let send = serialized.send(v).await;
@@ -119,67 +273,62 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
     peer_sender
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WrappedPBFTEvent<O>
-    where O: ServiceOperation
-{
-    pub event: PBFTEvent<O>,
-    from: PeerId,
-    signature: Option<SignatureResult>,
-}
-
-impl<O> WrappedPBFTEvent<O>
-    where O: ServiceOperation
-{
-    pub fn is_valid(&self) -> bool {
-        // TODO: Add real signature validation
-        true
-    }
-}
-
 pub struct CommunicationProxy<O>
     where O: ServiceOperation
 {
     myself: Peer,
+    signature_secret_key: SecretKey,
+
     indexed_participants: Vec<Peer>,
-    peer_db: HashMap<PeerId, (Peer, UnboundedSender<WrappedPBFTEvent<O>>)>,
+    peer_db: HashMap<PeerId, (PeerIndex, Peer)>,
+    peer_senders: HashMap<PeerId, UnboundedSender<WrappedPBFTEvent<O>>>,
     // Combines all receivers into a single stream
     receiver_multiplexer: UnboundedReceiver<WrappedPBFTEvent<O>>,
 }
-
-type Peers = Vec<Peer>;
 
 // TODO: Implement rebroadcasting to subvert byzantine peers
 impl<O> CommunicationProxy<O>
     where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
-    pub async fn new(myself: Peer, peers: Peers) -> Self {
+    pub async fn new(configuration: Configuration) -> Self {
+        let myself = configuration.this_replica;
+        let peers = configuration.peers;
+
+        let (proxy_sender, proxy_receiver) = unbounded_channel();
+
         // Index peers
         let mut participants = vec![myself.clone()];
-        let (proxy_sender, proxy_receiver) = unbounded_channel();
+        participants.extend_from_slice(&peers);
+        participants.sort_by_key(|p| p.id.clone());
 
         // Set up server to listen for incoming messages. These messages are then rerouted to the proxy receiver
         let hostname = myself.hostname.clone();
+        let peer_db: HashMap<PeerId, (PeerIndex, Peer)> = participants.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (p.id.clone(), (i as PeerIndex, p.clone()))
+            })
+            .collect();
+
+        let peer_db_clone = peer_db.clone();
         tokio::spawn(async move {
-            listen_for_events(hostname, proxy_sender).await;
+            listen_for_events(hostname, proxy_sender, peer_db_clone).await;
         });
 
         // Connect to all peers
-        let mut peer_db = HashMap::new();
-        for p in peers.into_iter() {
-            // TODO: Validate peer data at this point (eg. check duplication)
-            participants.push(p.clone());
-
+        let mut peer_senders = HashMap::new();
+        for p in peers.iter() {
             // Connect to the peer and get a handle on sending messages to this peer
             let peer_sender = connect_to(p.hostname.clone()).await;
-            peer_db.insert(p.id.clone(), (p, peer_sender));
+            peer_senders.insert(p.id.clone(), peer_sender);
         }
 
-        participants.sort_by_key(|p| p.id.clone());
         CommunicationProxy {
             myself,
+            signature_secret_key: configuration.signature_secret_key,
             indexed_participants: participants,
             peer_db,
+            peer_senders,
             receiver_multiplexer: proxy_receiver,
         }
     }
@@ -188,19 +337,28 @@ impl<O> CommunicationProxy<O>
         self.receiver_multiplexer.recv().await
     }
 
+    // Generates a digital signature of a PBFT event
     pub fn wrap(&self, event: &PBFTEvent<O>) -> WrappedPBFTEvent<O> {
-        // TODO: Compute digital signature
+        // If unwrap fails, that is a serious issue that needs to be fixed as protocol can't function without
+        // proper serialization of PBFT events
+        let serialized_event = serde_json::to_string(event).unwrap();
+        let signature = self.signature_secret_key.sign(serialized_event.as_bytes(), Some(Noise::generate()));
         WrappedPBFTEvent {
+            witness: SignedPayload {
+                from: self.myself.id.clone(),
+                serialized_event,
+                signature: signature.as_ref().to_vec()
+            },
             event: event.clone(),
-            from: "".to_string(),
-            signature: None,
         }
     }
 
     pub fn broadcast(&self, event: PBFTEvent<O>) {
-        for (p, s) in self.peer_db.values() {
+        // We don't want to keep recomputing the digital signature which is costly.
+        let packaged_event = self.wrap(&event);
+        for s in self.peer_senders.values() {
             // TODO: Handle send error
-            let _ = s.send(self.wrap(&event));
+            let _ = s.send(packaged_event.clone());
         }
     }
 
@@ -209,17 +367,25 @@ impl<O> CommunicationProxy<O>
             panic!("Peer {} is not valid!", to);
         }
         let peer = self.indexed_participants.get(to as usize).unwrap();
-        let sender = &self.peer_db.get(&peer.id).unwrap().1;
+        let sender = &self.peer_senders.get(&peer.id).unwrap();
 
         // TODO: Handle send error
         let _ = sender.send(self.wrap(&event));
     }
 
-    pub fn num_peers(&self) -> usize {
+    pub fn num_participants(&self) -> usize {
         self.peer_db.len()
     }
 
     pub fn my_index(&self) -> PeerIndex {
         self.indexed_participants.iter().position(|p| p.id == self.myself.id).unwrap() as PeerIndex
+    }
+
+    pub fn validate_signed_payload(&self, payload: SignedPayload) -> Result<WrappedPBFTEvent<O>, String> {
+        let res = WrappedPBFTEvent::<O>::from_signed_payload(payload, &self.peer_db);
+        if let Err(e) = &res {
+            info!("{:?}", e);
+        }
+        res
     }
 }

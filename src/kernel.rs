@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use log::{debug, info, warn};
-use crate::communication_proxy::{CommunicationProxy, PeerIndex, WrappedPBFTEvent};
+use crate::communication_proxy::{CommunicationProxy, PeerIndex, SignedPayload, WrappedPBFTEvent};
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 
@@ -46,8 +46,15 @@ pub struct RequestPayload<O>
     where O: ServiceOperation
 {
     pub op: O,
-    // TODO: Validate this field
     pub op_digest: DigestResult,
+}
+
+impl<O> RequestPayload<O>
+    where O: ServiceOperation
+{
+    pub fn is_valid(&self) -> bool {
+        self.op.digest() == self.op_digest
+    }
 }
 
 impl<O> RequestPayload<O>
@@ -77,7 +84,7 @@ pub struct CheckpointSummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewChange {
-    from: PeerIndex,
+    pub from: PeerIndex,
     view: ViewstampId,
     log_low_mark: SequenceNumber,
     checkpoints: Vec<CheckpointSummary>,
@@ -87,15 +94,14 @@ pub struct ViewChange {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NewView<O>
-    where O: ServiceOperation
+pub struct NewView
 {
-    from: PeerIndex,
+    pub from: PeerIndex,
     view: ViewstampId,
     // We deviate from the PBFT paper by not using view-change acks to convince non-primaries
     // of the existence of view changes. Instead we use digital signatures to prove that a view
     // change was in fact sent.
-    view_change_proofs: Vec<WrappedPBFTEvent<O>>,
+    view_change_proofs: Vec<SignedPayload>,
     selected_checkpoint: CheckpointSummary,
     // This is a list of contiguous, selected messages immediately after the selected_log_low
     selected_messages: Vec<Option<PrepTriple>>,
@@ -109,7 +115,6 @@ pub enum PBFTEvent<O>
     PrePrepare {
         from: PeerIndex,
         data: PrepTriple,
-        // TODO: Validate this field
         request: RequestPayload<O>,
     },
     Prepare {
@@ -125,7 +130,7 @@ pub enum PBFTEvent<O>
         data: CheckpointSummary,
     },
     ViewChange(ViewChange),
-    NewView(NewView<O>),
+    NewView(NewView),
     StateTransferRequest(StateTransferRequest),
     StateTransferResponse(StateTransferResponse<O>),
 }
@@ -182,7 +187,7 @@ pub struct PBFTState<O>
 
     // -------------------- VIEW CHANGE FIELDS --------------------
     view_change_log: Vec<WrappedPBFTEvent<O>>,
-    new_view_log: HashMap<ViewstampId, NewView<O>>,
+    new_view_log: HashMap<ViewstampId, NewView>,
     requested_digests: HashMap<(SequenceNumber, ViewstampId), DigestResult>,
 
     // -------------------- STATE TRANSFER FIELDS --------------------
@@ -199,8 +204,7 @@ impl<O> PBFTState<O>
         sequence_window_length: u64,
         checkpoint_interval: u64,
     ) -> PBFTState<O> {
-        // Add +1 to include self
-        let num_participants = (communication_proxy.num_peers() + 1) as PeerIndex;
+        let num_participants = communication_proxy.num_participants() as PeerIndex;
         let my_index = communication_proxy.my_index();
         PBFTState {
             communication_proxy,
@@ -969,10 +973,10 @@ impl<O> PBFTState<O>
         }
 
         // View change is possible
+        // Package all the view changes received as a collection of proofs
         let view_change_proofs = self.view_change_log.iter()
-            .filter(|e| {
-                let data = convert_to_view_change(e);
-                data.view == self.view
+            .map(|e| {
+                e.witness()
             })
             .cloned()
             .collect();
@@ -988,7 +992,7 @@ impl<O> PBFTState<O>
         debug!("Peer {}: Generated new view proof for view {}.", self.my_index, self.view);
     }
 
-    fn process_new_view(&mut self, data: NewView<O>) {
+    fn process_new_view(&mut self, data: NewView) {
         // TODO: Collect garbage on old view data in both the manager and PBFT state
         if data.view == 0 {
             debug!("Peer {}: Dropping new view for view 0", self.my_index);
@@ -1008,24 +1012,37 @@ impl<O> PBFTState<O>
         }
 
         // Validate the view change data to ensure proof is not malformed
-        let valid_view_change_proofs = data.view_change_proofs.iter()
-            .all(|e| {
-                match &e.event {
-                    PBFTEvent::ViewChange(_) => {
-                        // Validate signature of the event
-                        e.is_valid()
+        let wrapped_view_changes = data.view_change_proofs.iter()
+            .map(|payload| {
+                self.communication_proxy.validate_signed_payload(payload.clone())
+            })
+            .collect::<Vec<Result<WrappedPBFTEvent<O>, _>>>();
+
+        let valid_view_change_proofs = wrapped_view_changes.iter()
+            .all(|result| {
+                match result {
+                    Ok(e) => {
+                        matches!(&e.event, PBFTEvent::ViewChange(_))
                     }
-                    _ => {
+                    Err(_) => {
+                        // The signed payload could not be properly validated
                         false
                     }
                 }
             });
+
         if !valid_view_change_proofs {
             info!("Peer {}: Dropping new view (view = {}) from peer {} who provided invalid new view proofs.", self.my_index, data.view, data.from);
             return;
         }
 
-        let view_changes_iter = data.view_change_proofs.iter().map(convert_to_view_change);
+        // Convert all the proofs into view changes now that they have all been confirmed to be valid
+        let wrapped_view_changes = wrapped_view_changes.into_iter()
+            .map(|r| {
+                r.unwrap()
+            })
+            .collect::<Vec<WrappedPBFTEvent<O>>>();
+        let view_changes_iter = wrapped_view_changes.iter().map(convert_to_view_change);
 
         let num_viewchangers = view_changes_iter.clone()
             .map(|change| change.from)
@@ -1246,6 +1263,7 @@ impl<O> PBFTState<O>
         // We just moved into a new view so trash all data less than the current one.
         self.new_view_log.retain(|v, _| *v > self.view);
         self.requested_digests = Default::default();
+        info!("Peer {}: Successfully moved into view {}.", self.my_index, self.view);
     }
 
     fn is_valid_selected_checkpoint<'a, I: Iterator<Item=&'a ViewChange> + Clone>(&self, view_changes: I, candidate: &CheckpointSummary) -> bool {
