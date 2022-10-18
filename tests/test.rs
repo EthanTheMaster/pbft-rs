@@ -293,7 +293,6 @@ async fn test_checkpoint_garbage_collection() {
         }
 
         let state = state.lock().await;
-        println!("{}", state.log_low_mark());
         // Garbage collection should purge any old checkpoints
         assert!(state.log_low_mark() >= rounds*CHECKPOINT_INTERVAL, "Test Checkpoint Low Log Mark Update");
     }
@@ -428,3 +427,5 @@ async fn test_view_change_safety_mod2() {
 async fn test_view_change_safety_mod0() {
     view_change_safety_runner(6).await;
 }
+
+// TODO: Test impersonation prevention
