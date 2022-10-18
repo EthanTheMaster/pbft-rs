@@ -1,3 +1,5 @@
+mod merkle_tree_test;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -6,10 +8,11 @@ use ed25519_compact::{KeyPair, Seed};
 use futures::future::join_all;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Deserialize};
+use sha3::{Sha3_256, Digest};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use pbft_library::communication_proxy::{CommunicationProxy, Configuration, Peer, PeerIndex};
-use pbft_library::kernel::{Digestible, DigestResult, NoOp, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
+use pbft_library::kernel::{DIGEST_LENGTH_BYTES, Digestible, DigestResult, NoOp, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
@@ -31,7 +34,23 @@ enum Operation {
 
 impl Digestible for Operation {
     fn digest(&self) -> DigestResult {
-        format!("{:?}", self).into_bytes()
+        let mut res = [0; DIGEST_LENGTH_BYTES];
+        let mut hasher = Sha3_256::new();
+        match self {
+            Operation::Some(m) => {
+                hasher.update(b"Some");
+                hasher.update(m.as_bytes());
+                let hash = &hasher.finalize()[..];
+                res.copy_from_slice(hash);
+            }
+            Operation::None => {
+                hasher.update(b"None");
+                let hash = &hasher.finalize()[..];
+                res.copy_from_slice(hash);
+
+            }
+        }
+        res
     }
 }
 

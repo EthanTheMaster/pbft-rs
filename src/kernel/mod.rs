@@ -16,7 +16,9 @@ mod state_transfer;
 // Index of peer in total ordering
 pub type ViewstampId = u64;
 pub type SequenceNumber = u64;
-pub type DigestResult = Vec<u8>;
+
+pub const DIGEST_LENGTH_BYTES: usize = 32;
+pub type DigestResult = [u8;DIGEST_LENGTH_BYTES];
 
 // Trait allowing cryptographic hash to be computed
 pub trait Digestible {

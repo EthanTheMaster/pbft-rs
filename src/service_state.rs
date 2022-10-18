@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use crate::communication_proxy::PeerIndex;
 use crate::kernel::{Digestible, DigestResult, SequenceNumber, ServiceOperation};
 use serde::{Serialize, Deserialize};
+use crate::merkle_tree::{MembershipProof, MerkleTree};
 
 
 // High level representation of user service state
@@ -15,8 +16,10 @@ pub struct ServiceState<O>
     noop_digest: DigestResult,
     // List of items awaiting to be placed into the log ... this is internal
     // and should not be reflected in the digest which is based on the finalized log!
+    // The log presented should not have gaps.
     buffer: HashMap<usize, O>,
     log: Vec<O>,
+    merkle_tree: MerkleTree
 }
 
 // Used to aid in state transfer
@@ -36,6 +39,7 @@ impl<O> ServiceState<O>
             return;
         }
         self.log.push(op);
+        self.merkle_tree.append(op_digest);
     }
 
     pub fn log(&self) -> &Vec<O> {
@@ -80,7 +84,8 @@ impl<O> Default for ServiceState<O>
         ServiceState {
             noop_digest: O::noop().digest(),
             buffer: Default::default(),
-            log: Vec::new()
+            log: Vec::new(),
+            merkle_tree: MerkleTree::new(O::noop().digest())
         }
     }
 }
@@ -89,8 +94,7 @@ impl<O> Digestible for ServiceState<O>
     where O: ServiceOperation
 {
     fn digest(&self) -> DigestResult {
-        // TODO: Implement digest
-        vec![]
+        self.merkle_tree.root()
     }
 }
 
