@@ -330,10 +330,9 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
         self.communication_proxy.broadcast(checkpoint_event);
         debug!("Peer {}: Created checkpoint at {}.", self.my_index, self.last_executed);
 
-        // TODO: Revisit this and make more space efficient
-        self.checkpoints.push(Checkpoint {
+        self.checkpoints.push(CheckpointSummary {
             sequence_number: self.last_executed,
-            service_state: self.current_state.clone(),
+            service_state_summary: self.current_state.summarize(),
         });
 
         self.collect_garbage(&data);

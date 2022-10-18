@@ -18,7 +18,8 @@ pub type ViewstampId = u64;
 pub type SequenceNumber = u64;
 
 pub const DIGEST_LENGTH_BYTES: usize = 32;
-pub type DigestResult = [u8;DIGEST_LENGTH_BYTES];
+
+pub type DigestResult = [u8; DIGEST_LENGTH_BYTES];
 
 // Trait allowing cryptographic hash to be computed
 pub trait Digestible {
@@ -75,13 +76,6 @@ impl<O> RequestPayload<O>
     }
 }
 
-pub struct Checkpoint<O>
-    where O: ServiceOperation
-{
-    sequence_number: SequenceNumber,
-    service_state: ServiceState<O>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointSummary {
     sequence_number: SequenceNumber,
@@ -96,7 +90,7 @@ pub struct ViewChange {
     checkpoints: Vec<CheckpointSummary>,
     // P and Q sets
     prepared: HashSet<PrepTriple>,
-    preprepared: HashSet<PrepTriple>
+    preprepared: HashSet<PrepTriple>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,7 +170,7 @@ pub struct PBFTState<O>
 
     // Keeps track of committed requests at a regular interval
     pending_committed: Vec<(O, SequenceNumber)>,
-    checkpoints: Vec<Checkpoint<O>>,
+    checkpoints: Vec<CheckpointSummary>,
     checkpoint_interval: u64,
 
     // Represents the P set in PBFT paper
@@ -212,6 +206,15 @@ impl<O> PBFTState<O>
     ) -> PBFTState<O> {
         let num_participants = communication_proxy.num_participants() as PeerIndex;
         let my_index = communication_proxy.my_index();
+        let current_state: ServiceState<O> = Default::default();
+        let initial_checkpoint = CheckpointSummary {
+            sequence_number: 0,
+            service_state_summary: ServiceStateSummary {
+                log_length: 0,
+                log_digest: current_state.digest(),
+            },
+        };
+
         PBFTState {
             communication_proxy,
             my_index,
@@ -221,12 +224,9 @@ impl<O> PBFTState<O>
             message_log: Vec::new(),
             sequence_number: 0,
             last_executed: 0,
-            current_state: Default::default(),
+            current_state,
             sequence_window_length,
-            checkpoints: vec![Checkpoint { // The initial state is stable
-                sequence_number: 0,
-                service_state: Default::default(),
-            }],
+            checkpoints: vec![initial_checkpoint],
             pending_committed: vec![],
             checkpoint_interval,
             prepared: Default::default(),
@@ -485,14 +485,7 @@ impl<O> PBFTState<O>
         self.is_view_active = false;
         self.view = new_view;
 
-        let checkpoints = self.checkpoints.iter()
-            .map(|c| {
-                CheckpointSummary {
-                    sequence_number: c.sequence_number,
-                    service_state_summary: c.service_state.summarize(),
-                }
-            })
-            .collect();
+        let checkpoints = self.checkpoints.clone();
 
         // Assemble the prepared and preprepared indices into a set of tuples for packaging on the network
         let prepared = self.prepared.values().cloned().collect();
@@ -501,8 +494,8 @@ impl<O> PBFTState<O>
                 digest_map.iter().map(|(d, v)| {
                     PrepTriple {
                         sequence_number: *n,
-                        digest: d.clone(),
-                        view: *v
+                        digest: *d,
+                        view: *v,
                     }
                 })
             })
@@ -513,7 +506,7 @@ impl<O> PBFTState<O>
             log_low_mark: self.log_low_mark(),
             checkpoints,
             prepared,
-            preprepared
+            preprepared,
         });
 
         self.process_view_change(self.communication_proxy.wrap(&view_change));

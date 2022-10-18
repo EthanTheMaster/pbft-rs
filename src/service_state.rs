@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use log::warn;
 use crate::communication_proxy::PeerIndex;
 use crate::kernel::{Digestible, DigestResult, SequenceNumber, ServiceOperation};
 use serde::{Serialize, Deserialize};
@@ -38,6 +39,7 @@ impl<O> ServiceState<O>
             // Don't process noops
             return;
         }
+        // Attempt to include operation into merkle tree
         let successful_append = self.merkle_tree.append(op_digest);
         if successful_append.is_ok() {
             self.log.push(op);
@@ -59,13 +61,16 @@ impl<O> ServiceState<O>
     // gaps between the current state and the future operation. Queues up this operation
     // for inclusion into the finalized log.
     pub fn insert_operation(&mut self, index: usize, operation: O) {
-        if operation.digest() == self.noop_digest {
+        let op_digest = operation.digest();
+        if  op_digest == self.noop_digest {
             // Don't process noops
             return;
         }
         if index < self.log.len() {
             // There is no point in inserting an already finalized operation
-            // TODO: Add warning if there is a mismatch! Safety issue!
+            if &op_digest != self.merkle_tree.items().get(index).unwrap() {
+                warn!("Safety violation: Operation being inserted into log has a different digest than current finalized operation.");
+            }
             return;
         }
         self.buffer.insert(index, operation);
@@ -81,8 +86,6 @@ impl<O> ServiceState<O>
         self.merkle_tree.generate_proof(&indices, right_boundary)
     }
 }
-
-// TODO: Add efficient state transfer mechanism
 
 impl<O> Default for ServiceState<O>
     where O: ServiceOperation
