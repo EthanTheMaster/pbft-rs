@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::communication_proxy::PeerIndex;
 use crate::kernel::{Digestible, DigestResult, SequenceNumber, ServiceOperation};
 use serde::{Serialize, Deserialize};
-use crate::merkle_tree::{MembershipProof, MerkleTree};
+use crate::merkle_tree::{MembershipProof, MerkleIndex, MerkleTree};
 
 
 // High level representation of user service state
@@ -38,8 +38,10 @@ impl<O> ServiceState<O>
             // Don't process noops
             return;
         }
-        self.log.push(op);
-        self.merkle_tree.append(op_digest);
+        let successful_append = self.merkle_tree.append(op_digest);
+        if successful_append.is_ok() {
+            self.log.push(op);
+        }
     }
 
     pub fn log(&self) -> &Vec<O> {
@@ -72,6 +74,11 @@ impl<O> ServiceState<O>
             let next_op = self.buffer.remove(&self.log.len()).unwrap();
             self.broadcast_finality(next_op);
         }
+    }
+
+    pub fn construct_membership_proof(&self, indices: &HashSet<MerkleIndex>, size: usize) -> Option<MembershipProof> {
+        let right_boundary = (size - 1) as MerkleIndex;
+        self.merkle_tree.generate_proof(&indices, right_boundary)
     }
 }
 
@@ -125,6 +132,6 @@ pub enum StateTransferResponse<O>
         log_length: usize,
         log_item_index: usize,
         operation: O,
-        merkle_proof: Vec<DigestResult>
+        merkle_proof: MembershipProof
     }
 }

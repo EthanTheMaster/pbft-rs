@@ -1,4 +1,5 @@
 use crate::kernel::*;
+use crate::merkle_tree::{MerkleIndex, MerkleTree};
 
 impl<O> PBFTState<O>
     where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
@@ -37,12 +38,19 @@ impl<O> PBFTState<O>
                 if let Some(op) = self.current_state.log().get(log_item_index as usize) {
                     // Requester presumable has validated that the checkpoint is valid so there should be a committed message
                     // at the requested sequence_number <= checkpoint_number
+                    // TODO: Send more than operation for efficiency
+                    let merkle_proof = self.current_state().construct_membership_proof(&HashSet::from([log_item_index as MerkleIndex]), log_length);
+                    if merkle_proof.is_none() {
+                        // It was not possible creating a proof
+                        return;
+                    }
+                    let merkle_proof = merkle_proof.unwrap();
                     self.communication_proxy.send(from, PBFTEvent::StateTransferResponse(StateTransferResponse::ServiceStateItemProof {
                         log_length,
                         log_item_index,
                         operation: op.clone(),
                         // TODO: Construct actual proof
-                        merkle_proof: vec![],
+                        merkle_proof,
                     }));
                 }
             }
@@ -76,7 +84,7 @@ impl<O> PBFTState<O>
                         self.message_log.push(PBFTEvent::PrePrepare {
                             from: self.primary(self.view),
                             data: data.clone(),
-                            request: RequestPayload { op: operation, op_digest: digest.clone() },
+                            request: RequestPayload { op: operation, op_digest: *digest },
                         });
 
                         if !self.is_primary(self.my_index) {
@@ -101,10 +109,30 @@ impl<O> PBFTState<O>
                 }
             }
             StateTransferResponse::ServiceStateItemProof { log_length, log_item_index, operation, merkle_proof } => {
-                if let Some((checkpoint_number, service_state_digest)) = self.known_service_state_digests.get(&log_length) {
-                    // TODO: Actually validate the proof and index again length
+                if log_item_index >= log_length {
+                    // Ignore messages outside the log slice in question
+                    return;
+                }
+
+                if let Some((_checkpoint_number, service_state_digest)) = self.known_service_state_digests.get(&log_length) {
+                    let is_proof_valid = MerkleTree::is_valid_proof(service_state_digest, &merkle_proof);
+                    if !is_proof_valid {
+                        // Ignore invalid proofs
+                        return;
+                    }
+                    let op_digest = operation.digest();
+                    let is_operation_proven = merkle_proof.items.iter().any(|(i, d)| {
+                        (*i as usize) == log_item_index && op_digest == *d
+                    });
+                    if !is_operation_proven {
+                        // The operation provided never appeared in the membership proof
+                        return;
+                    }
+
+
                     self.current_state.insert_operation(log_item_index, operation);
                 }
+
                 // Immediately after inserting this operation we synchronized the service state up to a known checkpoint
                 if let Some((checkpoint_number, _)) = self.known_service_state_digests.get(&self.current_state.log().len()) {
                     if self.last_executed >= *checkpoint_number {

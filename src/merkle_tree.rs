@@ -3,14 +3,14 @@ use sha3::{Digest, Sha3_256};
 use crate::kernel::{DIGEST_LENGTH_BYTES, DigestResult};
 use serde::{Serialize, Deserialize};
 
-type MerkleIndex = u64;
+pub type MerkleIndex = u64;
 
-const INDEX_BITS: usize = 64;
+pub const INDEX_BITS: usize = 64;
 
 // Holds the hash of a node in the merkle tree and the height of the subtree rooted at this node.
 // The subtree is a complete binary tree and the height is the number of edges between the root
 // and any leaf.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Node {
     hash: DigestResult,
     height: usize,
@@ -51,13 +51,12 @@ fn deserialize_internal_node(node: &String) -> Option<InternalNode> {
 
 // Proof demonstrating the memberships of the listed items at their corresponding index
 // for a merkle tree containing `size` items
-type MerkleProofItem = (MerkleIndex, DigestResult);
+pub type MerkleProofItem = (MerkleIndex, DigestResult);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MembershipProof {
     pub internal_hashes: HashMap<String, DigestResult>,
-    pub padding_digest: DigestResult,
     pub items: HashSet<MerkleProofItem>,
-    pub size: MerkleIndex,
+    pub right_boundary: MerkleIndex,
 }
 
 // Struct to help build a merkle tree for the service state and to generate/validate proofs
@@ -110,10 +109,11 @@ impl MerkleTree {
     }
 
     // Appends an item to the list being validated by the merkle tree
-    pub fn append(&mut self, digest: DigestResult) {
+    // Returns an error whenever the append could not be fulfilled
+    pub fn append(&mut self, digest: DigestResult) -> Result<(), ()> {
         if self.items.len() == MerkleIndex::MAX as usize {
             // The merkle tree cannot hold anymore data!
-            return;
+            return Err(());
         }
 
         // This new item is treated as a leaf
@@ -123,6 +123,8 @@ impl MerkleTree {
         });
         self.items.push(digest);
         MerkleTree::merge_partial_digests(&mut self.running_digests);
+
+        Ok(())
     }
 
     fn merge_partial_digests(running_digests: &mut Vec<Node>) {
@@ -178,7 +180,16 @@ impl MerkleTree {
 
     // Computes the hash of a node that is the root of a subtree holding elements with index
     // in [left_index, right_index]. The size of this interval must be 2^height.
-    fn compute_node_hash(&self, left_index: MerkleIndex, right_index: MerkleIndex, height: usize) -> DigestResult {
+    //
+    // The right boundary field restricts the elements in the merkle tree list to those with index
+    // in [0, right_boundary] simulating a merkle tree spanning a specific initial portion.
+    fn compute_node_hash(
+        &self,
+        right_boundary: MerkleIndex,
+        left_index: MerkleIndex,
+        right_index: MerkleIndex,
+        height: usize
+    ) -> DigestResult {
         // The left index and right index must match iff the height is 0
         if (left_index == right_index) != (height == 0) {
             panic!("Correctness error.");
@@ -193,6 +204,9 @@ impl MerkleTree {
 
         if height == 0 {
             // Base case
+            if left_index > right_boundary {
+                return self.padding_digest
+            }
             return match self.items.get(left_index as usize) {
                 None => {
                     self.padding_digest
@@ -202,18 +216,18 @@ impl MerkleTree {
                 }
             }
         } else {
-            // We treat the list in the merkle tree to be padded up to the closest power of two.
+            // We treat the list in the merkle tree to be padded up to a power of two size.
             // The subtree focused on right now contains only padding elements and we can easily
             // compute the hash without further recursion.
-            if self.items.len() <= left_index as usize {
+            if right_boundary < left_index {
                 return self.precomputed_padding[height];
             }
 
             // Induction
             let mid = left_index + (right_index - left_index) / 2;
             // Compute the hashes of the left and right subtree
-            let left = self.compute_node_hash(left_index, mid, height - 1);
-            let right = self.compute_node_hash(mid + 1, right_index, height - 1);
+            let left = self.compute_node_hash(right_boundary, left_index, mid, height - 1);
+            let right = self.compute_node_hash(right_boundary, mid + 1, right_index, height - 1);
             MerkleTree::hash(left, right)
         }
     }
@@ -225,10 +239,14 @@ impl MerkleTree {
     // of height h containing elements with index [left_index, right_index].
     //
     // For this inductive construction to work, the size of [left_index, right_index] must be 2^height.
+    //
+    // The size field restricts the items in the list to the items with index in [0, size) simulating
+    // a merkle tree with only size elements.
     fn record_complement_cover_hashes(
         &self,
         indices: &HashSet<MerkleIndex>,
         current_node: InternalNode,
+        right_boundary: MerkleIndex,
         complement_cover_hashes: &mut HashMap<InternalNode, DigestResult>,
         left_index: MerkleIndex,
         right_index: MerkleIndex,
@@ -252,14 +270,8 @@ impl MerkleTree {
             if !indices.contains(&left_index) {
                 // Clearly if we have a singleton binary tree and this node is not a selected
                 // index, it must be in the cover of the complement
-                match self.items.get(left_index as usize) {
-                    None => {
-                        complement_cover_hashes.insert(current_node, self.padding_digest);
-                    }
-                    Some(d) => {
-                        complement_cover_hashes.insert(current_node, *d);
-                    }
-                }
+                let hash = self.compute_node_hash(right_boundary, left_index, right_index, 0);
+                complement_cover_hashes.insert(current_node, hash);
             }
         } else {
             // Inductive case
@@ -270,7 +282,7 @@ impl MerkleTree {
             if !exists_index_in_interval {
                 // If the tree has a root not covering any index, the root must be in the cover
                 // of the complement.
-                let hash = self.compute_node_hash(left_index, right_index, height);
+                let hash = self.compute_node_hash(right_boundary, left_index, right_index, height);
                 complement_cover_hashes.insert(current_node, hash);
             } else {
                 let mid = left_index + (right_index - left_index) / 2;
@@ -290,6 +302,7 @@ impl MerkleTree {
                 self.record_complement_cover_hashes(
                     indices,
                     left,
+                    right_boundary,
                     complement_cover_hashes,
                     left_index, mid, height - 1,
                 );
@@ -298,6 +311,7 @@ impl MerkleTree {
                 self.record_complement_cover_hashes(
                     indices,
                     right,
+                    right_boundary,
                     complement_cover_hashes,
                     mid + 1, right_index, height - 1,
                 );
@@ -305,12 +319,12 @@ impl MerkleTree {
         }
     }
 
-    fn largest_index_height_after_pow_two_padding(size: MerkleIndex) -> (MerkleIndex, usize) {
+    pub fn largest_index_height_after_pow_two_padding(right_boundary: MerkleIndex) -> (MerkleIndex, usize) {
         let mut res: MerkleIndex = 1;
         for k in 0..INDEX_BITS {
             // INVARIANT: res = 2^k at this point
-            // Checking if 2^k is bigger than n
-            if res >= size {
+            // Checking if 2^k is strictly bigger than right_boundary
+            if res > right_boundary {
                 return (res - 1, k);
             }
 
@@ -320,22 +334,28 @@ impl MerkleTree {
             }
         }
 
-        // 2^(INDEX_BITS - 1) < n <= 2^INDEX_BITS
+        // 2^(INDEX_BITS - 1) <= right_boundary <= 2^INDEX_BITS
         (MerkleIndex::MAX, INDEX_BITS)
     }
 
     // Given the current state of the merkle tree, generates a membership proof for the items
-    // at the provided indices
-    pub fn generate_proof(&self, indices: &HashSet<MerkleIndex>) -> Option<MembershipProof> {
-        if !indices.iter().all(|i| (*i as usize) < self.items.len()) {
+    // at the provided indices, but for a modified merkle tree holding a slice of the elements.
+    // This slice includes elements with index [0, right_boundary].
+    pub fn generate_proof(&self, indices: &HashSet<MerkleIndex>, right_boundary: MerkleIndex) -> Option<MembershipProof> {
+        if !indices.iter().all(|i| *i <= right_boundary) {
             return None;
         }
 
-        let size = self.items.len() as MerkleIndex;
-        let (largest_index, height) = MerkleTree::largest_index_height_after_pow_two_padding(size);
+        let (largest_index, height) = MerkleTree::largest_index_height_after_pow_two_padding(right_boundary);
         let mut proof = HashMap::new();
 
-        self.record_complement_cover_hashes(indices, vec![], &mut proof, 0, largest_index, height);
+        self.record_complement_cover_hashes(
+            indices,
+            vec![],
+            right_boundary,
+            &mut proof,
+            0, largest_index, height
+        );
 
         let internal_hashes = proof.into_iter()
             .map(|(k, v)| {
@@ -345,21 +365,30 @@ impl MerkleTree {
 
         let items = indices.iter()
             .map(|i| {
-                // Unwrap is safe by initial check
-                (*i, *self.items.get(*i as usize).unwrap())
+                if *i > right_boundary {
+                    // This should not be possible by initial check
+                    return (*i, self.padding_digest);
+                }
+
+                match self.items.get(*i as usize) {
+                    None => {
+                        (*i, self.padding_digest)
+                    }
+                    Some(d) => {
+                        (*i, *d)
+                    }
+                }
             })
             .collect();
 
         Some(MembershipProof {
             internal_hashes,
-            padding_digest: self.padding_digest,
             items,
-            size
+            right_boundary
         })
     }
 
     fn compute_root_from_proof(
-        padding_digest: DigestResult,
         index_hashes: &HashMap<MerkleIndex, DigestResult>,
         internal_hashes: &HashMap<InternalNode, DigestResult>,
         current_node: InternalNode,
@@ -392,7 +421,6 @@ impl MerkleTree {
             let mut left = current_node.clone();
             left.push(Direction::Left);
             let left_hash = MerkleTree::compute_root_from_proof(
-                padding_digest,
                 index_hashes,
                 internal_hashes,
                 left,
@@ -403,7 +431,6 @@ impl MerkleTree {
             let mut right = current_node;
             right.push(Direction::Right);
             let right_hash = MerkleTree::compute_root_from_proof(
-                padding_digest,
                 index_hashes,
                 internal_hashes,
                 right,
@@ -427,10 +454,9 @@ impl MerkleTree {
             .map(|(k, v)| (k.unwrap(), v))
             .collect::<HashMap<InternalNode, DigestResult>>();
 
-        let (largest_index, height) = MerkleTree::largest_index_height_after_pow_two_padding(proof.size);
+        let (largest_index, height) = MerkleTree::largest_index_height_after_pow_two_padding(proof.right_boundary);
 
         let computed_root_hash = MerkleTree::compute_root_from_proof(
-            proof.padding_digest,
             &proof.items.iter().cloned().collect(),
             &internal_hashes,
             vec![],
