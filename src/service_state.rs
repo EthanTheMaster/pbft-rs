@@ -83,7 +83,7 @@ impl<O> ServiceState<O>
 
     pub fn construct_membership_proof(&self, indices: &HashSet<MerkleIndex>, size: usize) -> Option<MembershipProof> {
         let right_boundary = (size - 1) as MerkleIndex;
-        self.merkle_tree.generate_proof(&indices, right_boundary)
+        self.merkle_tree.generate_proof(indices, right_boundary)
     }
 }
 

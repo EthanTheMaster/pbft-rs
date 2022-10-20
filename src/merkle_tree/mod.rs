@@ -3,6 +3,8 @@ use sha3::{Digest, Sha3_256};
 use crate::kernel::{DIGEST_LENGTH_BYTES, DigestResult};
 use serde::{Serialize, Deserialize};
 
+mod test;
+
 pub type MerkleIndex = u64;
 
 pub const INDEX_BITS: usize = 64;
@@ -35,7 +37,7 @@ fn serialize_internal_node(node: &InternalNode) -> String {
     }))
 }
 
-fn deserialize_internal_node(node: &String) -> Option<InternalNode> {
+fn deserialize_internal_node(node: &str) -> Option<InternalNode> {
     // The string must only consist of L and R's
     if !node.chars().all(|c| c == 'L' || c == 'R') {
         return None;

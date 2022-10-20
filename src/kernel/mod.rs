@@ -14,7 +14,8 @@ use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferReque
 mod normal_operation;
 mod view_change;
 mod state_transfer;
-pub mod view_change_manager;
+mod view_change_manager;
+mod test;
 
 // Aliasing away concrete types to make
 // possible refactors easier
@@ -343,13 +344,13 @@ impl<O> PBFTState<O>
         }
     }
 
-    pub fn max_faults(&self) -> PeerIndex {
+    fn max_faults(&self) -> PeerIndex {
         // Compute biggest integer f such that: n >= 3f + 1
         // Integer division performs floor
         (self.num_participants - 1) / 3
     }
 
-    pub fn quorum_size(&self) -> PeerIndex {
+    fn quorum_size(&self) -> PeerIndex {
         let n = self.num_participants;
         let f = self.max_faults();
         let sum = n + f + 1;
@@ -361,7 +362,7 @@ impl<O> PBFTState<O>
         }
     }
 
-    pub fn weak_certificate_size(&self) -> PeerIndex {
+    fn weak_certificate_size(&self) -> PeerIndex {
         self.max_faults() + 1
     }
 
@@ -374,7 +375,7 @@ impl<O> PBFTState<O>
         self.primary(self.view) == participant_index
     }
 
-    pub fn log_low_mark(&self) -> SequenceNumber {
+    fn log_low_mark(&self) -> SequenceNumber {
         self.checkpoints.iter().map(|c| {
             c.sequence_number
         }).min().unwrap_or(0)

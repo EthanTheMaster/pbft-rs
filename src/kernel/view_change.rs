@@ -371,11 +371,11 @@ impl<O> PBFTState<O>
                     match self.find_op_with_digest(&selected_message.digest) {
                         None => {
                             // No such message has been found attempt to synchronize
-                            self.requested_digests.insert((selected_message.sequence_number, new_view.view), selected_message.digest.clone());
+                            self.requested_digests.insert((selected_message.sequence_number, new_view.view), selected_message.digest);
                             self.communication_proxy.broadcast(PBFTEvent::StateTransferRequest(StateTransferRequest::ViewChangeDigestProof {
                                 from: self.my_index,
                                 sequence_number: selected_message.sequence_number,
-                                digest: selected_message.digest.clone(),
+                                digest: selected_message.digest,
                             }));
                             // TODO: Improve this to obtain many proofs in parallel without generating a lot of traffic
                             // Exit because the replica is not synchronized on the digests
@@ -407,7 +407,7 @@ impl<O> PBFTState<O>
                                 self.message_log.push(PBFTEvent::PrePrepare {
                                     from: self.primary(new_view.view),
                                     data: data.clone(),
-                                    request: RequestPayload { op, op_digest: data.digest.clone() },
+                                    request: RequestPayload { op, op_digest: data.digest },
                                 });
                             }
                             if !is_prepared && self.primary(new_view.view) != self.my_index {

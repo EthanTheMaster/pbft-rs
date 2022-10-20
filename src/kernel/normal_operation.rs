@@ -29,17 +29,17 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
             match self.preprepared.get_mut(&data.sequence_number) {
                 None => {
                     let mut digest_map = HashMap::new();
-                    digest_map.insert(data.digest.clone(), data.view);
+                    digest_map.insert(data.digest, data.view);
                     self.preprepared.insert(data.sequence_number, digest_map);
                 }
                 Some(digest_map) => {
                     match digest_map.get(&data.digest) {
                         None => {
-                            digest_map.insert(data.digest.clone(), data.view);
+                            digest_map.insert(data.digest, data.view);
                         }
                         Some(other_view) => {
                             if data.view > *other_view {
-                                digest_map.insert(data.digest.clone(), data.view);
+                                digest_map.insert(data.digest, data.view);
                             } else {
                                 // Validate that preprepared only holds the most recent preprepared message
                                 // If the views are equal, then either the digests are equal or not.
@@ -158,7 +158,7 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
                 return;
             }
 
-            let request_digest = payload.op_digest.clone();
+            let request_digest = payload.op_digest;
 
             let data = PrepTriple {
                 view: self.view,

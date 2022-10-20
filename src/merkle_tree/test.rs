@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use pbft_library::merkle_tree::{MerkleIndex, MerkleTree};
+use crate::merkle_tree::*;
 
 #[test]
 fn test_root_computation() {

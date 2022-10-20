@@ -1,5 +1,3 @@
-mod merkle_tree_test;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -11,10 +9,9 @@ use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 use tokio::select;
 use tokio::sync::{Mutex as TokioMutex, Notify};
-use tokio::time::{timeout, sleep};
-use pbft_library::communication_proxy::{CommunicationProxy, Configuration, Peer, PeerIndex};
-use pbft_library::kernel::{DIGEST_LENGTH_BYTES, Digestible, DigestResult, NoOp, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
-use pbft_library::kernel::view_change_manager::ViewChangeManager;
+use tokio::time::{sleep, timeout};
+use crate::kernel::*;
+use crate::kernel::view_change_manager::ViewChangeManager;
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
@@ -264,6 +261,9 @@ async fn normal_operation_runner(n: usize) {
     for state in &network[0 .. n-f as usize] {
         let state = state.lock().await;
         assert_eq!(state.current_state().log(), &target);
+
+        // Ensure a view change did not happen
+        assert_eq!(state.view(), 0);
     }
 }
 
@@ -317,6 +317,9 @@ async fn test_out_of_order_commits() {
             continue;
         }
         assert_eq!(state.lock().await.current_state().log(), &target, "Testing out of order");
+
+        // Ensure a view change did not happen
+        assert_eq!(state.lock().await.view(), 0);
     }
 }
 

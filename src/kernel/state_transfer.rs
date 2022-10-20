@@ -9,7 +9,7 @@ impl<O> PBFTState<O>
         let current_log_length = self.current_state.log().len();
         self.known_service_state_digests.insert(
             checkpoint_summary.service_state_summary.log_length,
-            (checkpoint_summary.sequence_number, checkpoint_summary.service_state_summary.log_digest.clone())
+            (checkpoint_summary.sequence_number, checkpoint_summary.service_state_summary.log_digest)
         );
 
         for n in current_log_length..checkpoint_summary.service_state_summary.log_length {
@@ -78,7 +78,7 @@ impl<O> PBFTState<O>
                     if self.find_op_with_digest(digest).is_none() {
                         let data = PrepTriple {
                             sequence_number,
-                            digest: digest.clone(),
+                            digest: *digest,
                             view: self.view,
                         };
                         self.message_log.push(PBFTEvent::PrePrepare {

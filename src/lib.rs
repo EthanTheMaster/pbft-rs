@@ -1,4 +1,4 @@
-pub mod service_state;
-pub mod communication_proxy;
-pub mod kernel;
-pub mod merkle_tree;
+mod service_state;
+mod communication_proxy;
+mod kernel;
+mod merkle_tree;
