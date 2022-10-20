@@ -1,15 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::time::Duration;
 use log::{debug, info, warn};
 use crate::communication_proxy::*;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
+use tokio::select;
+use tokio::sync::watch::Receiver;
+use crate::kernel::view_change_manager::{atomic_update_state, AtomicViewChangeManager};
 
 use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferRequest, StateTransferResponse};
 
 mod normal_operation;
 mod view_change;
 mod state_transfer;
+pub mod view_change_manager;
 
 // Aliasing away concrete types to make
 // possible refactors easier
@@ -158,6 +163,7 @@ pub struct PBFTState<O>
     message_log: Vec<PBFTEvent<O>>,
     sequence_number: SequenceNumber,
     last_executed: SequenceNumber,
+    execution_timeout: Duration,
 
     // The "service state" being replicated is the message log associated with
     // an atomic broadcast protocol, not user's actual service state. Implementing
@@ -186,7 +192,12 @@ pub struct PBFTState<O>
     preprepared: HashMap<SequenceNumber, HashMap<DigestResult, ViewstampId>>,
 
     // -------------------- VIEW CHANGE FIELDS --------------------
+    view_change_manager: AtomicViewChangeManager,
+    requested_view_change: Receiver<ViewstampId>,
+
+    view_change_timeout: Duration,
     view_change_log: Vec<WrappedPBFTEvent<O>>,
+    view_change_participants: HashMap<ViewstampId, HashSet<PeerIndex>>,
     new_view_log: HashMap<ViewstampId, NewView>,
     requested_digests: HashMap<(SequenceNumber, ViewstampId), DigestResult>,
 
@@ -200,7 +211,10 @@ impl<O> PBFTState<O>
     where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
     pub fn new(
+        view_change_manager: AtomicViewChangeManager,
         communication_proxy: CommunicationProxy<O>,
+        execution_timeout: Duration,
+        view_change_timeout: Duration,
         sequence_window_length: u64,
         checkpoint_interval: u64,
     ) -> PBFTState<O> {
@@ -215,6 +229,7 @@ impl<O> PBFTState<O>
             },
         };
 
+        let requested_view_change = view_change_manager.lock().unwrap().requested_view_change_rx();
         PBFTState {
             communication_proxy,
             my_index,
@@ -224,6 +239,7 @@ impl<O> PBFTState<O>
             message_log: Vec::new(),
             sequence_number: 0,
             last_executed: 0,
+            execution_timeout,
             current_state,
             sequence_window_length,
             checkpoints: vec![initial_checkpoint],
@@ -231,7 +247,11 @@ impl<O> PBFTState<O>
             checkpoint_interval,
             prepared: Default::default(),
             preprepared: Default::default(),
+            view_change_manager,
+            requested_view_change,
+            view_change_timeout,
             view_change_log: vec![],
+            view_change_participants: Default::default(),
             new_view_log: Default::default(),
             requested_digests: Default::default(),
             known_service_state_digests: Default::default(),
@@ -256,40 +276,70 @@ impl<O> PBFTState<O>
 
     pub async fn step(&mut self) {
         // TODO: Add rebroadcast logic to subvert byzantine peer. Wrapped event has proof that byzantine peer sent message.
-        let wrapped_event = self.communication_proxy.recv_event().await;
-        if wrapped_event.is_none() {
-            info!("Failed to read an event from communication proxy.");
-            return;
+        select! {
+            new_view = self.requested_view_change.changed() => {
+                // Attempt to do view change if alerted by the manager
+                if new_view.is_err() {
+                    return;
+                }
+                let new_view = *self.requested_view_change.borrow();
+                if new_view > self.view {
+                    // The jump size is guaranteed to be strictly greater than 0
+                    debug!("Peer {}: Changing to view {} as requested by view change manager.", self.my_index, new_view);
+                    self.change_view(new_view - self.view);
+                    // One view change is considered a single state transition. Do more state transitions
+                    // in the next invocation of step.
+                    return;
+                }
+            }
+            wrapped_event = self.communication_proxy.recv_event() => {
+                if wrapped_event.is_none() {
+                    info!("Failed to read an event from communication proxy.");
+                    return;
+                }
+                let wrapped_event = wrapped_event.unwrap();
+                match wrapped_event.event {
+                    PBFTEvent::Request(payload) => {
+                        self.process_request(payload);
+                    }
+                    PBFTEvent::PrePrepare { from, data, request } => {
+                        self.process_preprepare(from, data, request);
+                    }
+                    PBFTEvent::Prepare { from, data } => {
+                        self.process_prepare(from, data);
+                    }
+                    PBFTEvent::Commit { from, data } => {
+                        self.process_commit(from, data);
+                    }
+                    PBFTEvent::Checkpoint { from, data } => {
+                        self.process_checkpoint(from, data);
+                    }
+                    PBFTEvent::ViewChange(_) => {
+                        self.process_view_change(wrapped_event);
+                    }
+                    PBFTEvent::NewView(data) => {
+                        self.process_new_view(data);
+                    }
+                    PBFTEvent::StateTransferRequest(req) => {
+                        self.process_state_transfer_request(req);
+                    }
+                    PBFTEvent::StateTransferResponse(res) => {
+                        self.process_state_transfer_response(res);
+                    }
+                }
+            }
         }
-        let wrapped_event = wrapped_event.unwrap();
-        match wrapped_event.event {
-            PBFTEvent::Request(payload) => {
-                self.process_request(payload);
-            }
-            PBFTEvent::PrePrepare { from, data, request } => {
-                self.process_preprepare(from, data, request);
-            }
-            PBFTEvent::Prepare { from, data } => {
-                self.process_prepare(from, data);
-            }
-            PBFTEvent::Commit { from, data } => {
-                self.process_commit(from, data);
-            }
-            PBFTEvent::Checkpoint { from, data } => {
-                self.process_checkpoint(from, data);
-            }
-            PBFTEvent::ViewChange(_) => {
-                self.process_view_change(wrapped_event);
-            }
-            PBFTEvent::NewView(data) => {
-                self.process_new_view(data);
-            }
-            PBFTEvent::StateTransferRequest(req) => {
-                self.process_state_transfer_request(req);
-            }
-            PBFTEvent::StateTransferResponse(res) => {
-                self.process_state_transfer_response(res);
-            }
+
+        // Update the view change manager on the current PBFT state after state transition
+        let update = atomic_update_state(
+            self.view_change_manager.clone(),
+            self.primary(self.view),
+            self.view,
+            self.is_view_active,
+            self.current_state.log().len()
+        );
+        if !update {
+            warn!("Peer {}: Failed to update view change manager!", self.my_index);
         }
     }
 
@@ -516,19 +566,9 @@ impl<O> PBFTState<O>
 
         debug!("Peer {}: Engaging in a view change into view {}.", self.my_index, new_view);
 
-        // Purge old view data
-        self.view_change_log.retain(|e| {
-            if let PBFTEvent::ViewChange(data) = &e.event {
-                data.view >= self.view
-            } else {
-                false
-            }
-        });
-        self.new_view_log.retain(|v, _| {
-            *v >= self.view
-        });
-        self.requested_digests = Default::default();
 
+        self.collect_view_garbage();
+        // There may currently be enough data to perform a view change
         self.attempt_view_change();
     }
 }

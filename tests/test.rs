@@ -9,22 +9,29 @@ use futures::future::join_all;
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
-use tokio::sync::Mutex as TokioMutex;
-use tokio::time::timeout;
+use tokio::select;
+use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::time::{timeout, sleep};
 use pbft_library::communication_proxy::{CommunicationProxy, Configuration, Peer, PeerIndex};
 use pbft_library::kernel::{DIGEST_LENGTH_BYTES, Digestible, DigestResult, NoOp, PBFTEvent, PBFTState, PrepTriple, RequestPayload, ServiceOperation};
+use pbft_library::kernel::view_change_manager::ViewChangeManager;
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
 
 // The amount of time it takes to receive a request before it is determined that there are no
 // more messages.
-const NETWORK_QUIESCENT_TIMEOUT_SEC: u64 = 3;
+const NETWORK_QUIESCENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Rust runs tests in parallel and we cannot have tests interfering with each other
 // Networks are mocked up and simulated replicas must be assigned an ip uninhabited by
 // another process. This ensures that replicas are assigned a unique ip during the test.
 static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
+
+// For testing, these timeouts should be higher than the network quiescent timeout to give
+// replicas time to process all their messages without getting interrupted.
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum Operation {
@@ -95,9 +102,17 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
             signature_secret_key: secret_keys.get(i).unwrap().clone()
         };
         let proxy = CommunicationProxy::new(configuration).await;
-        res.push(PBFTState::new(proxy, SEQUENCE_WINDOW_LENGTH, CHECKPOINT_INTERVAL));
-    }
 
+        let view_change_manager = ViewChangeManager::new();
+        res.push(PBFTState::new(
+            view_change_manager,
+            proxy,
+            EXECUTION_TIMEOUT,
+            VIEW_CHANGE_TIMEOUT,
+            SEQUENCE_WINDOW_LENGTH,
+            CHECKPOINT_INTERVAL
+        ));
+    }
     res
 }
 
@@ -178,10 +193,10 @@ async fn drive_until_quiescent<O>(network: &Kernels<O>, nonparticipants: HashSet
         let state = state.clone();
         handles.push(tokio::spawn(async move {
             let state = state;
+            let mut state = state.lock().await;
             loop {
-                let mut state = state.lock().await;
                 let step = state.step();
-                let timeout_res = timeout(Duration::from_secs(NETWORK_QUIESCENT_TIMEOUT_SEC), step).await;
+                let timeout_res = timeout(NETWORK_QUIESCENT_TIMEOUT, step).await;
                 if timeout_res.is_err() {
                     break;
                 }
@@ -189,6 +204,34 @@ async fn drive_until_quiescent<O>(network: &Kernels<O>, nonparticipants: HashSet
         }));
     }
     let _ = join_all(handles).await;
+}
+
+async fn drive_until_notification<O>(network: &Kernels<O>, nonparticipants: HashSet<usize>) -> Arc<Notify>
+    where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
+{
+    let notification = Arc::new(Notify::new());
+    for (i, state) in network.iter().enumerate() {
+        if nonparticipants.contains(&i) {
+            continue;
+        };
+
+        let state = state.clone();
+        let notification = notification.clone();
+        tokio::spawn(async move {
+            let state = state;
+            let notification = notification;
+            let mut state = state.lock().await;
+            loop {
+                select! {
+                    _ = notification.notified() => {
+                        break
+                    }
+                    _ = state.step() => {}
+                };
+            }
+        });
+    }
+    notification
 }
 
 fn convert_network_to_kernels<O: ServiceOperation>(network: Vec<PBFTState<O>>) -> Kernels<O> {
@@ -322,7 +365,7 @@ async fn drain_receiver<O>(communication_proxy: &mut CommunicationProxy<O>)
 {
     loop {
         let recv = communication_proxy.recv_event();
-        let timeout_res = timeout(Duration::from_secs(NETWORK_QUIESCENT_TIMEOUT_SEC), recv).await;
+        let timeout_res = timeout(NETWORK_QUIESCENT_TIMEOUT, recv).await;
         if timeout_res.is_err() {
             break;
         }
@@ -445,6 +488,91 @@ async fn test_view_change_safety_mod2() {
 #[tokio::test]
 async fn test_view_change_safety_mod0() {
     view_change_safety_runner(6).await;
+}
+
+#[tokio::test]
+async fn test_inactive_primary_normal_operation_view_change() {
+    let n = 4;
+    let network = setup_mock_network::<Operation>(n).await;
+    let network = convert_network_to_kernels(network);
+    {
+        // Get all nonfaulty replicas to hear an incoming request.
+        let communication_proxy = &network.get(0).unwrap().lock().await.communication_proxy;
+        let msg = Operation::Some("HelloWorld".to_string());
+        communication_proxy.broadcast(PBFTEvent::Request(RequestPayload {
+            op_digest: msg.digest(),
+            op: msg,
+        }));
+    }
+
+    // Drive all nonfaulty replica
+    let notification = drive_until_notification(&network, HashSet::from([0])).await;
+    sleep(Duration::from_secs(30)).await;
+    notification.notify_waiters();
+
+    for state in &network[1..] {
+        assert!(state.lock().await.view() > 0);
+    }
+
+}
+
+#[tokio::test]
+async fn test_inactive_primary_new_view_view_change() {
+    let n = 4;
+    let network = setup_mock_network::<Operation>(n).await;
+    let network = convert_network_to_kernels(network);
+
+    // Change the view for all processors
+    for state in &network {
+        state.lock().await.change_view(1);
+    }
+
+    // Crash processor 1 who is the primary of the view change
+    let notification = drive_until_notification(&network, HashSet::from([1])).await;
+    sleep(Duration::from_secs(30)).await;
+    notification.notify_waiters();
+
+    // All nonfaulty processors should detect a failed view change primary and move to the next view
+    for (i, state) in network.iter().enumerate() {
+        if i == 1 {
+            continue;
+        }
+        assert_eq!(state.lock().await.view(), 2);
+    }
+
+}
+
+#[tokio::test]
+async fn test_view_change_to_a_correct_processor() {
+    let n = 4;
+    let network = setup_mock_network::<Operation>(n).await;
+    let network = convert_network_to_kernels(network);
+
+    // Simulate a weak certificate sized number of replica being multiple views ahead
+    for state in &network[2..=3] {
+        state.lock().await.change_view(1000);
+    }
+
+    // Get replicas 2 and 3 to high view number
+    let notification = drive_until_notification(&network, HashSet::from([0, 1])).await;
+    sleep(Duration::from_secs(5)).await;
+    notification.notify_waiters();
+
+    // Trigger view change for 0 and 1 who will detect a weak certificate vouching for a higher view
+    for state in &network[0..=1] {
+        state.lock().await.change_view(1);
+    }
+
+    let notification = drive_until_notification(&network, HashSet::new()).await;
+    sleep(Duration::from_secs(5)).await;
+    notification.notify_waiters();
+
+
+    // All processors should be "far ahead" of view 0
+    for state in &network {
+        assert!(state.lock().await.view() >= 1000);
+    }
+
 }
 
 // TODO: Test impersonation prevention

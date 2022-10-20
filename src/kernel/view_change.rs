@@ -1,4 +1,5 @@
 use crate::kernel::*;
+use crate::kernel::view_change_manager::{create_successful_view_change_watchdog, schedule_view_change};
 
 // Helper function to convert wrapped view change into a view change
 fn convert_to_view_change<O: ServiceOperation>(event: &WrappedPBFTEvent<O>) -> &ViewChange {
@@ -11,6 +12,58 @@ fn convert_to_view_change<O: ServiceOperation>(event: &WrappedPBFTEvent<O>) -> &
 impl<O> PBFTState<O>
     where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static
 {
+    pub fn collect_view_garbage(&mut self) {
+        self.view_change_log.retain(|e| {
+            if let PBFTEvent::ViewChange(data) = &e.event {
+                data.view >= self.view
+            } else {
+                false
+            }
+        });
+        self.new_view_log.retain(|v, _| *v > self.view);
+        self.view_change_participants.retain(|v, _| {
+            *v >= self.view
+        });
+        self.requested_digests.retain(|(_, v), _| *v >= self.view);
+    }
+    pub fn add_view_change_participant(&mut self, view: ViewstampId, participant: PeerIndex) {
+        match self.view_change_participants.get_mut(&view) {
+            None => {
+                self.view_change_participants.insert(view, HashSet::from([participant]));
+            }
+            Some(participants) => {
+                participants.insert(participant);
+            }
+        }
+
+        // Determine which liveliness conditions are enabled
+        let participants = self.view_change_participants.get(&view).unwrap();
+        // If in the process of doing a view change and there is now a quorum view changing in the
+        // same view, setup a deadline to get into this new view
+        if !self.is_view_active && self.view == view && participants.len() >= self.quorum_size() as usize {
+            create_successful_view_change_watchdog(
+                self.view_change_manager.clone(),
+                self.view(),
+                self.view_change_timeout
+            );
+        }
+
+        if !self.is_view_active {
+            // Some correct replica is attempting to view change in a strictly higher view. Transition to
+            // that view
+            let higher_view = self.view_change_participants.iter()
+                .filter(|(v, p)| {
+                    self.view < **v && p.len() >= self.weak_certificate_size() as usize
+                })
+                .map(|(v, _)| *v)
+                .max();
+            if let Some(higher_view) = higher_view {
+                schedule_view_change(self.view_change_manager.clone(), higher_view);
+                info!("Peer {}: Changing to view {} because some correct processor is view changing in that view.", self.my_index, higher_view);
+            }
+        }
+
+    }
 
     pub fn process_view_change(&mut self, view_change: WrappedPBFTEvent<O>) {
         let data = match &view_change.event {
@@ -21,15 +74,19 @@ impl<O> PBFTState<O>
             }
         };
 
-        if self.primary(data.view) != self.my_index {
-            // TODO: Activate timeout after hearing a quorum of view changes in the same current view
-            // TODO: Perform a view change when a weak certificate has been made for a strictly higher view
-            debug!("Peer {}: Dropping view change as not primary.", self.my_index);
+        if self.view() > data.view {
+            debug!("Peer {}: Dropping view change as currently in higher view.", self.my_index);
             return;
         }
 
-        if self.view() > data.view {
-            debug!("Peer {}: Dropping view change as currently in higher view.", self.my_index);
+
+        // Record this view change and after recording it may trigger additional
+        // timeout logic for liveliness.
+        self.add_view_change_participant(data.view, data.from);
+
+        if self.primary(data.view) != self.my_index {
+            // Do not continue processing the view change below which is only for the primary
+            // constructing a new view proof
             return;
         }
 
@@ -167,7 +224,11 @@ impl<O> PBFTState<O>
             .all(|result| {
                 match result {
                     Ok(e) => {
-                        matches!(&e.event, PBFTEvent::ViewChange(_))
+                        if let PBFTEvent::ViewChange(change) = &e.event {
+                            change.view == data.view
+                        } else {
+                            false
+                        }
                     }
                     Err(_) => {
                         // The signed payload could not be properly validated
@@ -272,12 +333,25 @@ impl<O> PBFTState<O>
             // Don't view change while in an active view
             return;
         }
-        if self.new_view_log.get(&self.view).is_none() {
-            // Can't view change. No valid new view message has been received for this view
+
+        let new_view = self.new_view_log.iter()
+            .filter(|(v, _)| {
+                self.view <= **v
+            })
+            .max_by_key(|(v, _)| **v)
+            .map(|(_, new_view)| new_view);
+        if new_view.is_none() {
+            // Can't view change. No valid new view message for view at or higher than current view
             return;
         }
 
-        let new_view = self.new_view_log.get(&self.view).unwrap();
+        // Choosing this new view at a potentially higher view is safe as automata from PBFT paper
+        // are allowed to keep view changing and we essentially simulated multiple view changes.
+        //
+        // Moreover this view is safe to transition to as a quorum participated in it and some
+        // correct replica is in this view.
+        let new_view = new_view.unwrap();
+
         let h = self.log_low_mark();
         if h < new_view.selected_checkpoint.sequence_number {
             debug!("Peer {}: Cannot view change because log low mark is behind.", self.my_index);
@@ -326,7 +400,7 @@ impl<O> PBFTState<O>
 
                             let data = PrepTriple {
                                 sequence_number: selected_message.sequence_number,
-                                digest: selected_message.digest.clone(),
+                                digest: selected_message.digest,
                                 view: self.view
                             };
                             if !is_preprepared {
@@ -358,13 +432,13 @@ impl<O> PBFTState<O>
             let n = h + i as SequenceNumber + 1;
             let data = PrepTriple {
                 sequence_number: n,
-                digest: noop_digest.clone(),
+                digest: noop_digest,
                 view: new_view.view,
             };
             self.message_log.push(PBFTEvent::PrePrepare {
                 from: self.primary(new_view.view),
                 data: data.clone(),
-                request: RequestPayload { op: noop.clone(), op_digest: noop_digest.clone() },
+                request: RequestPayload { op: noop.clone(), op_digest: noop_digest },
             });
             if self.primary(new_view.view) != self.my_index {
                 let prepare = PBFTEvent::Prepare {
@@ -378,6 +452,7 @@ impl<O> PBFTState<O>
 
         // All messages have been synchronized
         self.is_view_active = true;
+        self.view = new_view.view;
 
         let synchronized_preps = self.message_log.iter()
             .filter_map(|e| {
@@ -406,8 +481,7 @@ impl<O> PBFTState<O>
         }).max().unwrap_or(0);
 
         // We just moved into a new view so trash all data less than the current one.
-        self.new_view_log.retain(|v, _| *v > self.view);
-        self.requested_digests = Default::default();
+        self.collect_view_garbage();
         info!("Peer {}: Successfully moved into view {}.", self.my_index, self.view);
     }
 
