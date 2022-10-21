@@ -1,5 +1,6 @@
 use crate::kernel::*;
 use crate::kernel::view_change_manager::{create_successful_view_change_watchdog, schedule_view_change};
+use crate::pbft_replica::ServiceOperation;
 
 // Helper function to convert wrapped view change into a view change
 fn convert_to_view_change<O: ServiceOperation>(event: &WrappedPBFTEvent<O>) -> &ViewChange {

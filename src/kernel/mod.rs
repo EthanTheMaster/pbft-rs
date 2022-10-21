@@ -6,46 +6,26 @@ use crate::communication_proxy::*;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use tokio::select;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch::Receiver;
 use crate::kernel::view_change_manager::{atomic_update_state, AtomicViewChangeManager};
+use crate::pbft_replica::{Digestible, DigestResult, ServiceOperation};
 
 use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferRequest, StateTransferResponse};
 
 mod normal_operation;
 mod view_change;
 mod state_transfer;
-mod view_change_manager;
+pub mod view_change_manager;
+
+#[cfg(test)]
 mod test;
 
 // Aliasing away concrete types to make
 // possible refactors easier
 // Index of peer in total ordering
-pub type ViewstampId = u64;
+type ViewstampId = u64;
 pub type SequenceNumber = u64;
-
-pub const DIGEST_LENGTH_BYTES: usize = 32;
-
-pub type DigestResult = [u8; DIGEST_LENGTH_BYTES];
-
-// Trait allowing cryptographic hash to be computed
-pub trait Digestible {
-    fn digest(&self) -> DigestResult;
-    fn matches(&self, other: &Self) -> bool {
-        self.digest() == other.digest()
-    }
-}
-
-pub trait NoOp {
-    // Returns element representing no operation
-    fn noop() -> Self;
-}
-
-// Alias traits required of service operations being replicated
-pub trait ServiceOperation:
-Clone + Debug + Digestible + NoOp {}
-
-impl<T> ServiceOperation for T
-    where T: Clone + Debug + Digestible + NoOp {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct PrepTriple {
@@ -65,20 +45,16 @@ pub struct RequestPayload<O>
 impl<O> RequestPayload<O>
     where O: ServiceOperation
 {
-    pub fn is_valid(&self) -> bool {
-        self.op.digest() == self.op_digest
-    }
-}
-
-impl<O> RequestPayload<O>
-    where O: ServiceOperation
-{
     pub fn new(op: O) -> Self {
         let op_digest = op.digest();
         RequestPayload {
             op,
             op_digest,
         }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.op.digest() == self.op_digest
     }
 }
 
@@ -148,7 +124,7 @@ pub struct PBFTState<O>
     // Proxy gives a logical view of all messages received abstracting details
     // of deserialization and validation. It exposes an interface to communicate with
     // peers.
-    pub communication_proxy: CommunicationProxy<O>,
+    communication_proxy: CommunicationProxy<O>,
     num_participants: PeerIndex,
     my_index: PeerIndex,
 
@@ -214,6 +190,7 @@ impl<O> PBFTState<O>
     pub fn new(
         view_change_manager: AtomicViewChangeManager,
         communication_proxy: CommunicationProxy<O>,
+        state_change_publisher: UnboundedSender<O>,
         execution_timeout: Duration,
         view_change_timeout: Duration,
         sequence_window_length: u64,
@@ -221,7 +198,7 @@ impl<O> PBFTState<O>
     ) -> PBFTState<O> {
         let num_participants = communication_proxy.num_participants() as PeerIndex;
         let my_index = communication_proxy.my_index();
-        let current_state: ServiceState<O> = Default::default();
+        let current_state: ServiceState<O> = ServiceState::new(state_change_publisher);
         let initial_checkpoint = CheckpointSummary {
             sequence_number: 0,
             service_state_summary: ServiceStateSummary {
@@ -258,21 +235,22 @@ impl<O> PBFTState<O>
             known_service_state_digests: Default::default(),
         }
     }
-
-    pub fn is_view_active(&self) -> bool {
-        self.is_view_active
-    }
-    pub fn view(&self) -> ViewstampId {
+    fn view(&self) -> ViewstampId {
         self.view
     }
-    pub fn message_log(&self) -> &Vec<PBFTEvent<O>> {
+    fn message_log(&self) -> &Vec<PBFTEvent<O>> {
         &self.message_log
     }
-    pub fn last_executed(&self) -> SequenceNumber {
-        self.last_executed
-    }
-    pub fn current_state(&self) -> &ServiceState<O> {
+    fn current_state(&self) -> &ServiceState<O> {
         &self.current_state
+    }
+
+    pub fn broadcast_request(&mut self, op: O) {
+        let payload = RequestPayload::new(op);
+        if self.is_primary(self.my_index) {
+            self.process_request(payload.clone());
+        }
+        self.communication_proxy.broadcast(PBFTEvent::Request(payload));
     }
 
     pub async fn step(&mut self) {

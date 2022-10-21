@@ -4,7 +4,7 @@ use ed25519_compact::{Noise, PublicKey, SecretKey, Signature};
 use futures::{SinkExt, TryStreamExt};
 use log::{debug, info, warn};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use crate::kernel::{PBFTEvent, ServiceOperation};
+use crate::kernel::PBFTEvent;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -12,24 +12,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_serde::formats::SymmetricalJson;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use crate::pbft_replica::ServiceOperation;
 use crate::service_state::StateTransferRequest;
 
 type SignatureResult = Vec<u8>;
 
 pub type PeerId = String;
 pub type PeerIndex = u64;
+
 #[derive(Clone)]
 pub struct Peer {
     // TODO: Make id generic and sortable to assign total order to list of peers
     pub id: PeerId,
     pub hostname: String,
-    pub signature_public_key: PublicKey
+    pub signature_public_key: PublicKey,
 }
 
 pub struct Configuration {
     pub peers: Vec<Peer>,
     pub this_replica: Peer,
-    pub signature_secret_key: SecretKey
+    pub signature_secret_key: SecretKey,
+    pub reconnection_delay: Duration,
     // TODO: Add fields for timeout configuration
     // TODO: Add checkpoint management and log compression parameters
 }
@@ -38,7 +41,7 @@ pub struct Configuration {
 pub struct SignedPayload {
     pub from: PeerId,
     pub serialized_event: String,
-    pub signature: SignatureResult
+    pub signature: SignatureResult,
 }
 
 impl SignedPayload {
@@ -79,7 +82,7 @@ impl<O> WrappedPBFTEvent<O>
     // a wrapped event.
     pub fn from_signed_payload<Op>(
         payload: SignedPayload,
-        peer_db: &HashMap<PeerId, (PeerIndex, Peer)>
+        peer_db: &HashMap<PeerId, (PeerIndex, Peer)>,
     ) -> Result<WrappedPBFTEvent<Op>, String>
         where Op: ServiceOperation + DeserializeOwned
     {
@@ -89,7 +92,7 @@ impl<O> WrappedPBFTEvent<O>
         }
         let (peer_index, peer) = &peer_public_key.unwrap();
         if !payload.is_valid(&peer.signature_public_key) {
-            return Err(format!("Received payload with invalid signature! {:?}", payload))
+            return Err(format!("Received payload with invalid signature! {:?}", payload));
         }
 
         // Payload is valid ... attempt to deserialize it into an PBFTEvent
@@ -158,7 +161,7 @@ impl<O> WrappedPBFTEvent<O>
 
         Ok(WrappedPBFTEvent {
             witness: payload,
-            event
+            event,
         })
     }
 }
@@ -167,7 +170,7 @@ impl<O> WrappedPBFTEvent<O>
 async fn listen_for_events<O>(
     hostname: String,
     proxy_sender: UnboundedSender<WrappedPBFTEvent<O>>,
-    peer_db: HashMap<PeerId, (PeerIndex, Peer)>
+    peer_db: HashMap<PeerId, (PeerIndex, Peer)>,
 )
     where O: ServiceOperation + DeserializeOwned + std::marker::Send + 'static
 {
@@ -203,7 +206,7 @@ async fn listen_for_events<O>(
                             // Channel has been broken
                             return;
                         }
-                    },
+                    }
                     Err(err) => {
                         // The payload could not be validated
                         info!("{}", err);
@@ -217,7 +220,7 @@ async fn listen_for_events<O>(
 
 // Connects to a peer at the given hostname and returns a handle allowing the proxy to send messages
 // to this peer
-async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEvent<O>>
+async fn connect_to<'de, O>(hostname: String, reconnection_delay: Duration) -> UnboundedSender<WrappedPBFTEvent<O>>
     where O: ServiceOperation + Serialize + std::marker::Send + 'static
 {
     let (peer_sender, mut peer_receiver): (UnboundedSender<WrappedPBFTEvent<O>>, UnboundedReceiver<WrappedPBFTEvent<O>>) = unbounded_channel();
@@ -229,7 +232,7 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
             if socket.is_err() {
                 warn!("Cannot connect to {}. {:?}", hostname.clone(), socket.err().unwrap());
                 // TODO: Use less aggressive reconnection strategy
-                sleep(Duration::from_secs(1)).await;
+                sleep(reconnection_delay).await;
                 continue;
             }
 
@@ -266,7 +269,6 @@ async fn connect_to<'de, O>(hostname: String) -> UnboundedSender<WrappedPBFTEven
                     }
                 }
             }
-
         }
     });
 
@@ -319,7 +321,10 @@ impl<O> CommunicationProxy<O>
         let mut peer_senders = HashMap::new();
         for p in peers.iter() {
             // Connect to the peer and get a handle on sending messages to this peer
-            let peer_sender = connect_to(p.hostname.clone()).await;
+            let peer_sender = connect_to(
+                p.hostname.clone(),
+                configuration.reconnection_delay,
+            ).await;
             peer_senders.insert(p.id.clone(), peer_sender);
         }
 
@@ -347,7 +352,7 @@ impl<O> CommunicationProxy<O>
             witness: SignedPayload {
                 from: self.myself.id.clone(),
                 serialized_event,
-                signature: signature.as_ref().to_vec()
+                signature: signature.as_ref().to_vec(),
             },
             event: event.clone(),
         }

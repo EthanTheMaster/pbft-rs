@@ -9,9 +9,11 @@ use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 use tokio::select;
 use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::{sleep, timeout};
 use crate::kernel::*;
 use crate::kernel::view_change_manager::ViewChangeManager;
+use crate::pbft_replica::{DIGEST_LENGTH_BYTES, Digestible, DigestResult, NoOp, ServiceOperation};
 
 const CHECKPOINT_INTERVAL: u64 = 10;
 const SEQUENCE_WINDOW_LENGTH: u64 = 20;
@@ -30,6 +32,7 @@ static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
+// Mock custom operation for state machine to be replicated
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum Operation {
     Some(String),
@@ -96,14 +99,28 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
         let configuration = Configuration {
             peers: peers_i,
             this_replica: peers.get(i).unwrap().clone(),
-            signature_secret_key: secret_keys.get(i).unwrap().clone()
+            signature_secret_key: secret_keys.get(i).unwrap().clone(),
+            reconnection_delay: Duration::from_secs(1)
         };
         let proxy = CommunicationProxy::new(configuration).await;
 
         let view_change_manager = ViewChangeManager::new();
+        let (state_change_tx, mut state_change_rx) = unbounded_channel();
+
+        // Just drain the state_change_rx ... don't process broadcasts
+        tokio::spawn(async move {
+            loop {
+                let recv = state_change_rx.recv().await;
+                if recv.is_none() {
+                    break;
+                }
+            }
+        });
+
         res.push(PBFTState::new(
             view_change_manager,
             proxy,
+            state_change_tx,
             EXECUTION_TIMEOUT,
             VIEW_CHANGE_TIMEOUT,
             SEQUENCE_WINDOW_LENGTH,

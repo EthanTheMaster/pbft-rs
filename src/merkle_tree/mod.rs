@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use sha3::{Digest, Sha3_256};
-use crate::kernel::{DIGEST_LENGTH_BYTES, DigestResult};
 use serde::{Serialize, Deserialize};
+use crate::pbft_replica::{DIGEST_LENGTH_BYTES, DigestResult};
 
+#[cfg(test)]
 mod test;
 
 pub type MerkleIndex = u64;

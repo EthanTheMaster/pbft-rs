@@ -1,5 +1,6 @@
 use crate::kernel::*;
 use crate::kernel::view_change_manager::create_execution_watchdog;
+use crate::pbft_replica::ServiceOperation;
 
 impl<O> PBFTState<O>
 where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static

@@ -1,5 +1,6 @@
 use crate::kernel::*;
 use crate::merkle_tree::{MerkleIndex, MerkleTree};
+use crate::pbft_replica::ServiceOperation;
 
 impl<O> PBFTState<O>
     where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + 'static

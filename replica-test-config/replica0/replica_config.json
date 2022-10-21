@@ -1,0 +1,30 @@
+{
+  "peers": [
+    {
+      "id": "Peer1",
+      "hostname": "127.0.0.1:8001",
+      "signature_public_key_pem": "./replica-test-config/replica1/replica_public_key.pem"
+    },
+    {
+      "id": "Peer2",
+      "hostname": "127.0.0.1:8002",
+      "signature_public_key_pem": "./replica-test-config/replica2/replica_public_key.pem"
+    },
+    {
+      "id": "Peer3",
+      "hostname": "127.0.0.1:8003",
+      "signature_public_key_pem": "./replica-test-config/replica3/replica_public_key.pem"
+    }
+  ],
+  "replica_id": "Peer0",
+  "hostname": "127.0.0.1:8000",
+  "signature_public_key_pem": "./replica-test-config/replica0/replica_public_key.pem",
+  "signature_secret_key_pem": "./replica-test-config/replica0/replica_secret_key.pem",
+  "pbft_protocol_config": {
+    "log_length": 50,
+    "checkpoint_interval": 10,
+    "execution_timeout_ms": 30000,
+    "view_change_timeout_ms": 30000,
+    "reconnection_delay_ms": 10000
+  }
+}

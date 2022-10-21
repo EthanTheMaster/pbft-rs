@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use log::warn;
 use crate::communication_proxy::PeerIndex;
-use crate::kernel::{Digestible, DigestResult, SequenceNumber, ServiceOperation};
+use crate::kernel::SequenceNumber;
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc::UnboundedSender;
 use crate::merkle_tree::{MembershipProof, MerkleIndex, MerkleTree};
+use crate::pbft_replica::{Digestible, DigestResult, ServiceOperation};
 
 
 // High level representation of user service state
@@ -20,7 +22,8 @@ pub struct ServiceState<O>
     // The log presented should not have gaps.
     buffer: HashMap<usize, O>,
     log: Vec<O>,
-    merkle_tree: MerkleTree
+    merkle_tree: MerkleTree,
+    state_change_publisher: UnboundedSender<O>
 }
 
 // Used to aid in state transfer
@@ -33,6 +36,17 @@ pub struct ServiceStateSummary {
 impl<O> ServiceState<O>
     where O: ServiceOperation
 {
+
+    pub fn new(state_change_publisher: UnboundedSender<O>) -> Self {
+        ServiceState {
+            noop_digest: O::noop().digest(),
+            buffer: Default::default(),
+            log: Vec::new(),
+            merkle_tree: MerkleTree::new(O::noop().digest()),
+            state_change_publisher
+        }
+    }
+
     pub fn broadcast_finality(&mut self, op: O) {
         let op_digest = op.digest();
         if op_digest == self.noop_digest {
@@ -42,7 +56,8 @@ impl<O> ServiceState<O>
         // Attempt to include operation into merkle tree
         let successful_append = self.merkle_tree.append(op_digest);
         if successful_append.is_ok() {
-            self.log.push(op);
+            self.log.push(op.clone());
+            let _ = self.state_change_publisher.send(op);
         }
     }
 
@@ -84,19 +99,6 @@ impl<O> ServiceState<O>
     pub fn construct_membership_proof(&self, indices: &HashSet<MerkleIndex>, size: usize) -> Option<MembershipProof> {
         let right_boundary = (size - 1) as MerkleIndex;
         self.merkle_tree.generate_proof(indices, right_boundary)
-    }
-}
-
-impl<O> Default for ServiceState<O>
-    where O: ServiceOperation
-{
-    fn default() -> Self {
-        ServiceState {
-            noop_digest: O::noop().digest(),
-            buffer: Default::default(),
-            log: Vec::new(),
-            merkle_tree: MerkleTree::new(O::noop().digest())
-        }
     }
 }
 
