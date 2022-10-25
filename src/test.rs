@@ -1,6 +1,9 @@
 use std::path::PathBuf;
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
+use tokio::time::{sleep, timeout};
+use serial_test::serial;
 use crate::pbft_replica::{DIGEST_LENGTH_BYTES, Digestible, DigestResult, NoOp, PBFTReplica};
 
 // Mock custom operation for state machine to be replicated
@@ -39,6 +42,7 @@ impl NoOp for Operation {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_replica_normal_operation() {
     let replica0: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica0/replica_config.json"));
     let replica1: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica1/replica_config.json"));
@@ -61,4 +65,31 @@ async fn test_replica_normal_operation() {
         assert_eq!(replica.recv().await, Operation::Some(msg2.clone()));
         assert_eq!(replica.recv().await, Operation::Some(msg3.clone()));
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replica_failover_operation() {
+    // Disable the primary of view 0
+    // let replica0: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica0/replica_config.json"));
+    let mut replica1: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica1/replica_config.json"));
+    let mut replica2: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica2/replica_config.json"));
+    let mut replica3: PBFTReplica<Operation> = PBFTReplica::launch(PathBuf::from("./replica-test-config/replica3/replica_config.json"));
+
+    let msg = "HelloWorld".to_string();
+
+    // Keep sending message until a failover happens (30s)
+    for _ in 0..45 {
+        replica1.send(Operation::Some(msg.clone()));
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    // Attempt to grab any committed messages which must be msg. The test will fail if no message
+    // can be obtained because nothing was committed due to failover not happening.
+    let replica1_msg = timeout(Duration::from_secs(1), replica1.recv()).await;
+    let replica2_msg = timeout(Duration::from_secs(1), replica2.recv()).await;
+    let replica3_msg = timeout(Duration::from_secs(1), replica3.recv()).await;
+    assert_eq!(replica1_msg, Ok(Operation::Some(msg.clone())));
+    assert_eq!(replica2_msg, Ok(Operation::Some(msg.clone())));
+    assert_eq!(replica3_msg, Ok(Operation::Some(msg.clone())));
 }

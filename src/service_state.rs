@@ -23,6 +23,7 @@ pub struct ServiceState<O>
     buffer: HashMap<usize, O>,
     log: Vec<O>,
     merkle_tree: MerkleTree,
+    // Channel to alert subscribers to the inclusion of a new message
     state_change_publisher: UnboundedSender<O>
 }
 
@@ -96,6 +97,9 @@ impl<O> ServiceState<O>
         }
     }
 
+    // Generate cryptography proof for the contents of items at the provided indices. The size
+    // specifies a slice of the message log to simulate a stale message log that others who are
+    // behind can validate. All items with index >= size are treated as noop in the proof.
     pub fn construct_membership_proof(&self, indices: &HashSet<MerkleIndex>, size: usize) -> Option<MembershipProof> {
         let right_boundary = (size - 1) as MerkleIndex;
         self.merkle_tree.generate_proof(indices, right_boundary)

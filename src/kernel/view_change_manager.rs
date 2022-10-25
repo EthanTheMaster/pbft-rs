@@ -15,6 +15,7 @@ pub struct ViewChangeManager {
 
     // This value represents what the manager would like the replica to transition into
     requested_view_change: ViewstampId,
+    // Channel to alert of view change requests
     requested_view_change_tx: Sender<ViewstampId>,
     requested_view_change_rx: Receiver<ViewstampId>
 }
@@ -48,6 +49,7 @@ impl ViewChangeManager {
 
 }
 
+// Transaction that atomically alters the last seen PBFT state
 pub fn atomic_update_state(
     manager: AtomicViewChangeManager,
     last_seen_primary: PeerIndex,
@@ -72,6 +74,9 @@ pub fn atomic_update_state(
     }
 }
 
+// Establishes a deadline to include a new message to the message log, after which
+// a view change occurs. This is used after a request is received to ensure the system
+// makes progress as requests arrive.
 pub fn create_execution_watchdog(
     manager: AtomicViewChangeManager,
     current_log_length: usize,

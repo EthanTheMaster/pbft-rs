@@ -19,6 +19,7 @@ const REPLICA_CONFIG: &str = "replica_config.json";
 
 pub const DIGEST_LENGTH_BYTES: usize = 32;
 pub type DigestResult = [u8; DIGEST_LENGTH_BYTES];
+
 // Trait allowing cryptographic hash to be computed
 pub trait Digestible {
     fn digest(&self) -> DigestResult;
@@ -133,7 +134,11 @@ impl<O> PBFTReplica<O>
             panic!("The log length must be at least the checkpoint interval.");
         }
 
+        // This channel is used to forward incoming message requests to the PBFT state being driven
+        // by a tokio task
         let (request_sender, request_receiver) = unbounded_channel();
+
+        // This channel is used to listen for included, finalized messages
         let (state_change_publisher, state_change_subscriber) = unbounded_channel();
 
         tokio::spawn(async move {

@@ -169,11 +169,18 @@ pub struct PBFTState<O>
     preprepared: HashMap<SequenceNumber, HashMap<DigestResult, ViewstampId>>,
 
     // -------------------- VIEW CHANGE FIELDS --------------------
+    // The view change manager is responsible with monitoring the PBFT state for timely
+    // progress. It schedules view changes when appropriate. View changes should be scheduled
+    // through the view change manager and not through the PBFT state. This is ensure that
+    // state transitions happen sequentially, not concurrently.
     view_change_manager: AtomicViewChangeManager,
+    // The view manager alerts the PBFT state to view change through this channel
     requested_view_change: Receiver<ViewstampId>,
 
     view_change_timeout: Duration,
     view_change_log: Vec<WrappedPBFTEvent<O>>,
+    // This map tracks who has been seen in a view. That is, let (v, P) be an entry
+    // in this map. If some peer is in P, then that peer has been seen in view v.
     view_change_participants: HashMap<ViewstampId, HashSet<PeerIndex>>,
     new_view_log: HashMap<ViewstampId, NewView>,
     requested_digests: HashMap<(SequenceNumber, ViewstampId), DigestResult>,
@@ -245,17 +252,20 @@ impl<O> PBFTState<O>
         &self.current_state
     }
 
+    // We deviate from the PBFT paper in that clients do not broadcast requests to the replicas. Rather,
+    // clients must have access to a nonfaulty replica to initiate a request on the client's behalf.
+    // This allows replicas to lock down access to the state at the application level.
     pub fn broadcast_request(&mut self, op: O) {
         let payload = RequestPayload::new(op);
-        if self.is_primary(self.my_index) {
-            self.process_request(payload.clone());
-        }
+        self.process_request(payload.clone());
         self.communication_proxy.broadcast(PBFTEvent::Request(payload));
     }
 
     pub async fn step(&mut self) {
         // TODO: Add rebroadcast logic to subvert byzantine peer. Wrapped event has proof that byzantine peer sent message.
         select! {
+            // Prioritize view change requests before receiving event to prevent denial of service.
+            // Where events constantly arrive preventing a view change.
             new_view = self.requested_view_change.changed() => {
                 // Attempt to do view change if alerted by the manager
                 if new_view.is_err() {
@@ -423,7 +433,7 @@ impl<O> PBFTState<O>
                 // We have a pending operation that one ahead the last executed operation
                 self.current_state.broadcast_finality(o);
                 self.last_executed += 1;
-                info!("Peer {}: Executed operation {}! 🎉", self.my_index, n);
+                debug!("Peer {}: Executed operation {}! 🎉", self.my_index, n);
 
                 self.create_checkpoint();
                 // TODO: Generate high-level signal on execution
