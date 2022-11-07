@@ -23,8 +23,8 @@
   "pbft_protocol_config": {
     "log_length": 50,
     "checkpoint_interval": 10,
-    "execution_timeout_ms": 30000,
-    "view_change_timeout_ms": 30000,
-    "reconnection_delay_ms": 10000
+    "execution_timeout_ms": 5000,
+    "view_change_timeout_ms": 5000,
+    "reconnection_delay_ms": 2000
   }
 }

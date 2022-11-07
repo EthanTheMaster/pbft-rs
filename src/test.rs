@@ -78,8 +78,8 @@ async fn test_replica_failover_operation() {
 
     let msg = "HelloWorld".to_string();
 
-    // Keep sending message until a failover happens (30s)
-    for _ in 0..45 {
+    // Keep sending message until a failover happens 5s)
+    for _ in 0..10 {
         replica1.send(Operation::Some(msg.clone()));
         sleep(Duration::from_secs(1)).await;
     }

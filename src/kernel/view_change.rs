@@ -94,7 +94,7 @@ impl<O> PBFTState<O>
         if self.view_change_log.iter().map(convert_to_view_change).any(|change| {
             (change.from, change.view) == (data.from, data.view)
         }) {
-            debug!("Peer {}: Dropping view change as already received from change from peer.", self.my_index);
+            debug!("Peer {}: Dropping view change as already received change from peer.", self.my_index);
             return;
         }
 
@@ -105,7 +105,7 @@ impl<O> PBFTState<O>
                 && data.log_low_mark < n
                 && n <= data.log_low_mark + self.sequence_window_length
         }) {
-            debug!("Peer {}: Received view change from peer {} with malformed prepared field!", self.my_index, data.from);
+            warn!("Peer {}: Received view change from peer {} with malformed prepared field!", self.my_index, data.from);
             return;
         }
         if !data.preprepared.iter().all(|prep| {
@@ -114,7 +114,7 @@ impl<O> PBFTState<O>
                 && data.log_low_mark < n
                 && n <= data.log_low_mark + self.sequence_window_length
         }) {
-            debug!("Peer {}: Received view change from peer {} with malformed preprepared field!", self.my_index, data.from);
+            warn!("Peer {}: Received view change from peer {} with malformed preprepared field!", self.my_index, data.from);
             return;
         }
 

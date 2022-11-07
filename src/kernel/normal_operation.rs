@@ -142,12 +142,16 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
 
     pub fn process_request(&mut self, payload: RequestPayload<O>) {
         debug!("Peer {}: Received request: {:?}", self.my_index, payload);
-        create_execution_watchdog(
-            self.view_change_manager.clone(),
-            self.current_state.log().len(),
-            self.view,
-            self.execution_timeout
-        );
+
+        if self.is_view_active {
+            // Ensure liveliness during normal operation
+            create_execution_watchdog(
+                self.view_change_manager.clone(),
+                self.current_state.log().len(),
+                self.view,
+                self.execution_timeout
+            );
+        }
 
         // As the primary, this replica is responsible for initiating a preprepare request
         if self.is_primary(self.my_index)

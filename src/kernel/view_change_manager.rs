@@ -77,6 +77,9 @@ pub fn atomic_update_state(
 // Establishes a deadline to include a new message to the message log, after which
 // a view change occurs. This is used after a request is received to ensure the system
 // makes progress as requests arrive.
+//
+// The watchdog should be used to ensure that the service is live while in the normal operation.
+// If the replica is not in an active view, this watchdog can cause excessive view changing.
 pub fn create_execution_watchdog(
     manager: AtomicViewChangeManager,
     current_log_length: usize,
