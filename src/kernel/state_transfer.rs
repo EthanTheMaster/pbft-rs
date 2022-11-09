@@ -119,6 +119,7 @@ impl<O> PBFTState<O>
                     let is_proof_valid = MerkleTree::is_valid_proof(service_state_digest, &merkle_proof);
                     if !is_proof_valid {
                         // Ignore invalid proofs
+                        warn!("Peer {}: Received invalid merkle proof!", self.my_index);
                         return;
                     }
                     let op_digest = operation.digest();
@@ -127,24 +128,26 @@ impl<O> PBFTState<O>
                     });
                     if !is_operation_proven {
                         // The operation provided never appeared in the membership proof
+                        warn!("Peer {}: Received valid merkle proof but provided operation is not present in the proof!", self.my_index);
                         return;
                     }
 
 
                     self.current_state.insert_operation(log_item_index, operation);
-                }
+                    debug!("Peer {}: Inserted log item {}/{}.", self.my_index, log_item_index, log_length - 1);
 
-                // Immediately after inserting this operation we synchronized the service state up to a known checkpoint
-                if let Some((checkpoint_number, _)) = self.known_service_state_digests.get(&self.current_state.log().len()) {
-                    if self.last_executed >= *checkpoint_number {
-                        // For safety ensure that we are moving forward in the sequence number
-                        return;
+                    // Immediately after inserting this operation we synchronized the service state up to a known checkpoint
+                    if let Some((checkpoint_number, _)) = self.known_service_state_digests.get(&self.current_state.log().len()) {
+                        if self.last_executed >= *checkpoint_number {
+                            // For safety ensure that we are moving forward in the sequence number
+                            return;
+                        }
+
+                        self.last_executed = *checkpoint_number;
+                        self.create_checkpoint();
+                        // Enough information may have accumulated to perform view change
+                        self.attempt_view_change();
                     }
-
-                    self.last_executed = *checkpoint_number;
-                    self.create_checkpoint();
-                    // Enough information may have accumulated to perform view change
-                    self.attempt_view_change();
                 }
             }
         }

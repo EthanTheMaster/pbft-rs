@@ -452,20 +452,15 @@ impl<O> PBFTState<O>
 
     fn collect_garbage(&mut self, checkpoint_summary: &CheckpointSummary) {
         let checkpoint_sequence_number = checkpoint_summary.sequence_number;
-        let service_state_digest = &checkpoint_summary.service_state_summary.log_digest;
+        // Count the number of peers who corroborate this checkpoint
         let certificate_size = self.message_log.iter()
-            .filter(|e| {
-                if let PBFTEvent::Checkpoint { data, .. } = e {
-                    (&checkpoint_sequence_number, service_state_digest) == (&data.sequence_number, &data.service_state_summary.log_digest)
-                } else {
-                    false
+            .filter_map(|e| {
+                if let PBFTEvent::Checkpoint { from, data} = e {
+                    if checkpoint_summary == data {
+                        return Some(*from);
+                    }
                 }
-            })
-            .map(|e| {
-                if let PBFTEvent::Checkpoint { from, .. } = e {
-                    return *from;
-                }
-                panic!("Impossible case.")
+                None
             })
             .collect::<HashSet<PeerIndex>>()
             .len();
@@ -475,11 +470,6 @@ impl<O> PBFTState<O>
             return;
         }
         // TODO: Checkpoint has been stabilized. Record it.
-
-        // Attempt to synchronize up to the stabilized checkpoint
-        if checkpoint_sequence_number > self.last_executed {
-            self.synchronize_up_to_checkpoint(checkpoint_summary);
-        }
 
         self.checkpoints.retain(|c| c.sequence_number >= checkpoint_sequence_number);
         self.message_log

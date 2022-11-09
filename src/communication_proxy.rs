@@ -183,6 +183,7 @@ async fn listen_for_events<O>(
             break;
         }
 
+        // TODO: Only accept incoming connections from peer list. Do not accept connections from non-peers
         let (socket, _) = listener.accept().await.unwrap();
 
         let length_delimited = FramedRead::new(socket, LengthDelimitedCodec::new());

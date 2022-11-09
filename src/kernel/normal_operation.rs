@@ -70,18 +70,14 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
 
         // Count the number peers we have heard execute a prepare
         let certificate_size = self.message_log.iter()
-            .filter(|e| {
-                if let PBFTEvent::Prepare { data: other_data, .. } = e {
-                    data.eq(other_data)
-                } else {
-                    false
+            .filter_map(|e| {
+                if let PBFTEvent::Prepare { from, data: other_data} = e {
+                    if data.eq(other_data) {
+                        return Some(*from);
+                    }
                 }
-            })
-            .map(|e| {
-                if let PBFTEvent::Prepare { from, .. } = e {
-                    return *from;
-                }
-                panic!("Impossible case.")
+
+                None
             })
             .collect::<HashSet<PeerIndex>>()
             .len();
@@ -119,18 +115,14 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
     pub fn check_committed(&mut self, data: &PrepTriple) -> bool {
         // Count the number peers we have heard send a commit
         let certificate_size = self.message_log.iter()
-            .filter(|e| {
-                if let PBFTEvent::Commit { data: other_data, .. } = e {
-                    data.eq(other_data)
-                } else {
-                    false
+            .filter_map(|e| {
+                if let PBFTEvent::Commit { from, data: other_data} = e {
+                    if data.eq(other_data) {
+                        return Some(*from);
+                    }
                 }
-            })
-            .map(|e| {
-                if let PBFTEvent::Commit { from, .. } = e {
-                    return *from;
-                }
-                panic!("Impossible case.")
+
+                None
             })
             .collect::<HashSet<PeerIndex>>()
             .len();
@@ -350,9 +342,38 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
     }
 
     pub fn process_checkpoint(&mut self, from: PeerIndex, data: CheckpointSummary) {
+        // NOTE: This is the condition used in PBFT. However, this does not allow for recovery
+        // after a replica crash who might start with empty state. The state may be so far ahead
+        // that the fresh replica will reject otherwise valid checkpoints.
+        //
+        // We add additional logic for when the replica is not in an active view. It may use checkpoint
+        // data while inactive to get synchronized with peers through state transfer.
         if !self.is_sequence_number_in_window(data.sequence_number) {
-            debug!("Peer {}: Ignoring checkpoint at {} because message log is too full.", self.my_index, data.sequence_number);
+            if self.is_view_active {
+                debug!("Peer {}: Ignoring checkpoint at {} because message log is too full.", self.my_index, data.sequence_number);
+                return;
+            }
+
+            if data.sequence_number < self.sequence_number {
+                debug!("Peer {}: Ignoring checkpoint at {} because it is behind current execution.", self.my_index, data.sequence_number);
+                return;
+            }
+            // The replica is not in an active view and sees a future checkpoint.
         }
+
+        // Don't process duplicated checkpoints
+        let is_duplicate = self.message_log().iter()
+            .any(|e| {
+                if let PBFTEvent::Checkpoint { from: other_from, data: other_data } = e {
+                    return other_from == &from && other_data == &data;
+                }
+                false
+            });
+        if is_duplicate {
+            debug!("Peer {}: Ignoring checkpoint from {} at {} because it has already been seen.", self.my_index, from, data.sequence_number);
+            return;
+        }
+        // TODO: Mitigate attack where adversary produces a bunch of fake checkpoints
 
         self.message_log.push(PBFTEvent::Checkpoint {
             from,
@@ -362,6 +383,26 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
             },
         });
         debug!("Peer {}: Received checkpoint at {}.", self.my_index, self.last_executed);
+
+        // Attempt to synchronize up to the checkpoint, if supported by a weak certificate.
+        // The weak certificate certifies that this checkpoint has been accepted by some
+        // correct replica making it safe to synchronize to.
+        let certificate_size = self.message_log.iter()
+            .filter_map(|e| {
+                if let PBFTEvent::Checkpoint { from, data: other_data , ..} = e {
+                    if other_data == &data {
+                        return Some(*from);
+                    }
+                }
+                None
+            })
+            .collect::<HashSet<PeerIndex>>()
+            .len();
+
+        if data.sequence_number > self.last_executed && (certificate_size as PeerIndex) > self.weak_certificate_size() {
+            self.synchronize_up_to_checkpoint(&data);
+        }
+
         self.collect_garbage(&data);
     }
 }

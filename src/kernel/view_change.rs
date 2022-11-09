@@ -120,7 +120,19 @@ impl<O> PBFTState<O>
 
 
         // All preconditions passed
+
+        // View change data holds checkpoint information. All checkpoints included in the view change
+        // should have been broadcasted in the past, assuming the replica is following the protocol.
+        // Process each checkpoint in the view change which can aid in synchronizing with peers faster
+        // by processing possibly unseen checkpoints.
+        for checkpoint in data.checkpoints.iter() {
+            // Simulate receiving a checkpoint from the peer, possibly again
+            self.process_checkpoint(data.from, checkpoint.clone());
+        }
+
         self.view_change_log.push(view_change);
+
+
         self.attempt_new_view();
     }
 
