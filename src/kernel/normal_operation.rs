@@ -170,7 +170,6 @@ where O: ServiceOperation + Serialize + DeserializeOwned + std::marker::Send + '
             self.message_log.push(preprepare.clone());
             // Update bookkeeping
             let _ = self.check_preprepared(&data);
-            // TODO: Keep broadcasting preprepare until view change or committed
             self.communication_proxy.broadcast(preprepare);
 
             self.sequence_number += 1;

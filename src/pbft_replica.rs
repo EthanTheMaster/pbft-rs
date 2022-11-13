@@ -47,6 +47,7 @@ pub struct PBFTProtocolConfiguration {
     checkpoint_interval: usize,
     execution_timeout_ms: usize,
     view_change_timeout_ms: usize,
+    view_change_retransmission_interval_ms: usize,
     reconnection_delay_ms: usize,
 }
 
@@ -169,6 +170,7 @@ impl<O> PBFTReplica<O>
                 state_change_publisher,
                 Duration::from_millis(config.pbft_protocol_config.execution_timeout_ms as u64),
                 Duration::from_millis(config.pbft_protocol_config.view_change_timeout_ms as u64),
+                Duration::from_millis(config.pbft_protocol_config.view_change_retransmission_interval_ms as u64),
                 config.pbft_protocol_config.log_length as u64,
                 config.pbft_protocol_config.checkpoint_interval as u64
             );
@@ -239,6 +241,7 @@ pub fn generate_config_skeleton(destination_dir: PathBuf) {
             checkpoint_interval: 10,
             execution_timeout_ms: 30000,
             view_change_timeout_ms: 30000,
+            view_change_retransmission_interval_ms: 15000,
             reconnection_delay_ms: 10000
         }
     };

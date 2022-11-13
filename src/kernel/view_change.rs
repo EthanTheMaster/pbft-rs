@@ -208,7 +208,6 @@ impl<O> PBFTState<O>
     }
 
     pub fn process_new_view(&mut self, data: NewView) {
-        // TODO: Collect garbage on old view data in both the manager and PBFT state
         if data.view == 0 {
             debug!("Peer {}: Dropping new view for view 0", self.my_index);
             return;

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 use ed25519_compact::{Noise, PublicKey, SecretKey, Signature};
 use futures::{SinkExt, TryStreamExt};
@@ -33,8 +34,6 @@ pub struct Configuration {
     pub this_replica: Peer,
     pub signature_secret_key: SecretKey,
     pub reconnection_delay: Duration,
-    // TODO: Add fields for timeout configuration
-    // TODO: Add checkpoint management and log compression parameters
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,11 +85,11 @@ impl<O> WrappedPBFTEvent<O>
     ) -> Result<WrappedPBFTEvent<Op>, String>
         where Op: ServiceOperation + DeserializeOwned
     {
-        let peer_public_key = &peer_db.get(&payload.from);
-        if peer_public_key.is_none() {
+        let peer_info = &peer_db.get(&payload.from);
+        if peer_info.is_none() {
             return Err(format!("Received signed payload from unknown peer. {:?}", payload));
         }
-        let (peer_index, peer) = &peer_public_key.unwrap();
+        let (peer_index, peer) = &peer_info.unwrap();
         if !payload.is_valid(&peer.signature_public_key) {
             return Err(format!("Received payload with invalid signature! {:?}", payload));
         }
@@ -177,14 +176,33 @@ async fn listen_for_events<O>(
     let proxy_sender = proxy_sender.clone();
     let listener = TcpListener::bind(hostname.clone()).await.unwrap();
     info!("Listening on {}", hostname);
+
+    let acceptable_peer_ip = peer_db.values()
+        .filter_map(|(_, peer)| {
+            match peer.hostname.to_socket_addrs() {
+                Ok(addrs) => { Some(addrs) }
+                Err(_) => { None }
+            }
+        })
+        .flatten()
+        .map(|addr| {
+            addr.ip()
+        })
+        .collect::<HashSet<IpAddr>>();
+
     loop {
         if proxy_sender.is_closed() {
             // Channel has been broken ... don't attempt to send data down this channel
             break;
         }
 
-        // TODO: Only accept incoming connections from peer list. Do not accept connections from non-peers
         let (socket, _) = listener.accept().await.unwrap();
+        // Only accept incoming connections from peer list. Do not accept connections from non-peers
+        let is_peer = socket.peer_addr().map_or(false, |addr| acceptable_peer_ip.contains(&addr.ip()));
+        if !is_peer {
+            info!("Dropping connection with {:?} who is not registered as a peer.", socket.peer_addr());
+            break;
+        }
 
         let length_delimited = FramedRead::new(socket, LengthDelimitedCodec::new());
 
@@ -232,7 +250,6 @@ async fn connect_to<'de, O>(hostname: String, reconnection_delay: Duration) -> U
             // Reconnection logic
             if socket.is_err() {
                 warn!("Cannot connect to {}. {:?}", hostname.clone(), socket.err().unwrap());
-                // TODO: Use less aggressive reconnection strategy
                 sleep(reconnection_delay).await;
                 continue;
             }

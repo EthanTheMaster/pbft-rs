@@ -29,8 +29,12 @@ static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
 
 // For testing, these timeouts should be higher than the network quiescent timeout to give
 // replicas time to process all their messages without getting interrupted.
+//
+// Timeouts are used as a hack to determine if progress can be made. Making these values lower
+// than the quiescent timeout may confuse some tests into thinking that progress can still be made.
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const VIEW_CHANGE_RETRANSMISSION_INTERVAL: Duration = Duration::from_secs(10);
 
 // Mock custom operation for state machine to be replicated
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -123,6 +127,7 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
             state_change_tx,
             EXECUTION_TIMEOUT,
             VIEW_CHANGE_TIMEOUT,
+            VIEW_CHANGE_RETRANSMISSION_INTERVAL,
             SEQUENCE_WINDOW_LENGTH,
             CHECKPOINT_INTERVAL
         ));
@@ -594,5 +599,44 @@ async fn test_view_change_to_a_correct_processor() {
     }
 
 }
+
+#[tokio::test]
+async fn test_view_change_retransmission() {
+    let n = 4;
+    let network = setup_mock_network::<Operation>(n).await;
+    let network = convert_network_to_kernels(network);
+
+    // Jump replica 0 to a future view
+    {
+        let mut replica = network.get(0).unwrap().lock().await;
+        replica.change_view(1234);
+    }
+
+    // Drive only replica 0
+    let notification = drive_until_notification(&network, HashSet::from([1,2,3])).await;
+    // Let replica 0 retransmit the view change 3 times
+    for _ in 0..3 {
+        sleep(VIEW_CHANGE_RETRANSMISSION_INTERVAL).await;
+    }
+    notification.notify_waiters();
+
+    {
+        let mut num_view_changes = 0;
+        let mut replica = network.get(1).unwrap().lock().await;
+        while let Ok(Some(event)) = timeout(NETWORK_QUIESCENT_TIMEOUT, replica.communication_proxy.recv_event()).await {
+            if let PBFTEvent::ViewChange(change) = event.event {
+                if change.from == 0 && change.view == 1234 {
+                    num_view_changes += 1;
+                }
+            }
+        }
+
+        // Validate that at least 4 view changes were sent (1 for the view change switch + 3 retransmissions)
+        assert!(num_view_changes >= 4);
+    }
+
+}
+
+// TODO: Test weak certificate checkpoint synchronization from new view
 
 // TODO: Test impersonation prevention

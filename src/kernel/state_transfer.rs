@@ -39,7 +39,7 @@ impl<O> PBFTState<O>
                 if let Some(op) = self.current_state.log().get(log_item_index as usize) {
                     // Requester presumable has validated that the checkpoint is valid so there should be a committed message
                     // at the requested sequence_number <= checkpoint_number
-                    // TODO: Send more than operation for efficiency
+                    // TODO: Send more than one operation for efficiency
                     let merkle_proof = self.current_state().construct_membership_proof(&HashSet::from([log_item_index as MerkleIndex]), log_length);
                     if merkle_proof.is_none() {
                         // It was not possible creating a proof
@@ -50,7 +50,6 @@ impl<O> PBFTState<O>
                         log_length,
                         log_item_index,
                         operation: op.clone(),
-                        // TODO: Construct actual proof
                         merkle_proof,
                     }));
                 }

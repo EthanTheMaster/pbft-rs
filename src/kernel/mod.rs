@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch::Receiver;
+use tokio::time::{Interval, interval};
 use crate::kernel::view_change_manager::{atomic_update_state, AtomicViewChangeManager};
 use crate::pbft_replica::{Digestible, DigestResult, ServiceOperation};
 
@@ -176,8 +177,8 @@ pub struct PBFTState<O>
     view_change_manager: AtomicViewChangeManager,
     // The view manager alerts the PBFT state to view change through this channel
     requested_view_change: Receiver<ViewstampId>,
-
     view_change_timeout: Duration,
+    view_change_retransmission_interval: Interval,
     view_change_log: Vec<WrappedPBFTEvent<O>>,
     // This map tracks who has been seen in a view. That is, let (v, P) be an entry
     // in this map. If some peer is in P, then that peer has been seen in view v.
@@ -200,6 +201,7 @@ impl<O> PBFTState<O>
         state_change_publisher: UnboundedSender<O>,
         execution_timeout: Duration,
         view_change_timeout: Duration,
+        view_change_retransmission_interval: Duration,
         sequence_window_length: u64,
         checkpoint_interval: u64,
     ) -> PBFTState<O> {
@@ -235,6 +237,7 @@ impl<O> PBFTState<O>
             view_change_manager,
             requested_view_change,
             view_change_timeout,
+            view_change_retransmission_interval: interval(view_change_retransmission_interval),
             view_change_log: vec![],
             view_change_participants: Default::default(),
             new_view_log: Default::default(),
@@ -280,6 +283,10 @@ impl<O> PBFTState<O>
                     // in the next invocation of step.
                     return;
                 }
+            }
+            _ = self.view_change_retransmission_interval.tick(), if !self.is_view_active => {
+                // Retransmit the view change while not in an active view
+                self.communication_proxy.broadcast(PBFTEvent::ViewChange(self.create_view_change_message()));
             }
             wrapped_event = self.communication_proxy.recv_event() => {
                 if wrapped_event.is_none() {
@@ -436,7 +443,6 @@ impl<O> PBFTState<O>
                 debug!("Peer {}: Executed operation {}! 🎉", self.my_index, n);
 
                 self.create_checkpoint();
-                // TODO: Generate high-level signal on execution
                 // TODO: Persist execution
             } else if n <= self.last_executed {
                 // Supposedly pending committed message has already been executed. Drop the message
@@ -469,7 +475,6 @@ impl<O> PBFTState<O>
             // debug!("Peer {}: Cannot collect garbage because quorum has not been reached on checkpoint {}", self.my_index, checkpoint_sequence_number);
             return;
         }
-        // TODO: Checkpoint has been stabilized. Record it.
 
         self.checkpoints.retain(|c| c.sequence_number >= checkpoint_sequence_number);
         self.message_log
@@ -511,9 +516,29 @@ impl<O> PBFTState<O>
 
         let new_view = self.view + jump_size;
         debug!("Peer {}: Starting a view change: view {} -> {}.", self.my_index, self.view, new_view);
+        // Update view properties then construct the view change message
         self.is_view_active = false;
         self.view = new_view;
 
+        let view_change = PBFTEvent::ViewChange(self.create_view_change_message());
+
+        self.process_view_change(self.communication_proxy.wrap(&view_change));
+
+        self.communication_proxy.broadcast(view_change);
+
+        debug!("Peer {}: Engaging in a view change into view {}.", self.my_index, new_view);
+
+
+        self.collect_view_garbage();
+        // There may currently be enough data to perform a view change
+        self.attempt_view_change();
+    }
+
+    fn create_view_change_message(&self) -> ViewChange {
+        if self.is_view_active {
+            // The creation of a view change during an active view is probably an implementation error
+            warn!("Peer {}: Detected generation of a view change message while in an active view.", self.my_index);
+        }
         let checkpoints = self.checkpoints.clone();
 
         // Assemble the prepared and preprepared indices into a set of tuples for packaging on the network
@@ -529,25 +554,13 @@ impl<O> PBFTState<O>
                 })
             })
             .collect();
-        let view_change = PBFTEvent::ViewChange(ViewChange {
+        ViewChange {
             from: self.my_index,
-            view: new_view,
+            view: self.view,
             log_low_mark: self.log_low_mark(),
             checkpoints,
             prepared,
             preprepared,
-        });
-
-        self.process_view_change(self.communication_proxy.wrap(&view_change));
-
-        // TODO: Broadcast view change periodically
-        self.communication_proxy.broadcast(view_change);
-
-        debug!("Peer {}: Engaging in a view change into view {}.", self.my_index, new_view);
-
-
-        self.collect_view_garbage();
-        // There may currently be enough data to perform a view change
-        self.attempt_view_change();
+        }
     }
 }
