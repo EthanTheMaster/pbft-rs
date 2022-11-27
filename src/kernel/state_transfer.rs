@@ -144,8 +144,6 @@ impl<O> PBFTState<O>
 
                         self.last_executed = *checkpoint_number;
                         self.create_checkpoint();
-                        // Enough information may have accumulated to perform view change
-                        self.attempt_view_change();
                     }
                 }
             }

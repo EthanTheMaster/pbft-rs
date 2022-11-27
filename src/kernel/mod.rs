@@ -503,7 +503,8 @@ impl<O> PBFTState<O>
 
         debug!("Peer {}: Collected garbage before checkpoint {}.", self.my_index, checkpoint_sequence_number);
 
-        // TODO: Clean up state transfer book keeping
+        // The clearing of garbage transition may have enabled a new view change by shifting the low log mark.
+        self.attempt_view_change();
     }
 
     pub fn change_view(&mut self, jump_size: ViewstampId) {
