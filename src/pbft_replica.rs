@@ -45,9 +45,15 @@ pub struct PBFTProtocolConfiguration {
     // TODO: Validate log_length >= checkpoint_interval
     log_length: usize,
     checkpoint_interval: usize,
+    // Deadline assigned for a request to be executed before a view change occurs
     execution_timeout_ms: usize,
+    // The amount of time to remain in an active view before view changing
+    view_stay_timeout_ms: usize,
+    // Deadline assigned for a view with enough participants to successfully view change
     view_change_timeout_ms: usize,
+    // The delay between each view change retransmission
     view_change_retransmission_interval_ms: usize,
+    // The delay waited before a reconnection attempt is made to a dropped peer
     reconnection_delay_ms: usize,
 }
 
@@ -163,7 +169,7 @@ impl<O> PBFTReplica<O>
                 reconnection_delay: Duration::from_millis(config.pbft_protocol_config.reconnection_delay_ms as u64)
             }).await;
 
-            let view_change_manager = ViewChangeManager::new();
+            let view_change_manager = ViewChangeManager::new(Duration::from_millis(config.pbft_protocol_config.view_stay_timeout_ms as u64));
             let mut pbft = PBFTState::new(
                 view_change_manager,
                 communication_proxy,
@@ -239,10 +245,11 @@ pub fn generate_config_skeleton(destination_dir: PathBuf) {
         pbft_protocol_config: PBFTProtocolConfiguration {
             log_length: 50,
             checkpoint_interval: 10,
-            execution_timeout_ms: 30000,
-            view_change_timeout_ms: 30000,
-            view_change_retransmission_interval_ms: 15000,
-            reconnection_delay_ms: 10000
+            execution_timeout_ms: 5000,
+            view_stay_timeout_ms: 30000,
+            view_change_timeout_ms: 10000,
+            view_change_retransmission_interval_ms: 2000,
+            reconnection_delay_ms: 2000
         }
     };
 

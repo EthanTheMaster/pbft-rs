@@ -33,6 +33,7 @@ static NEXT_PORT_AVAILABLE: AtomicU16 = AtomicU16::new(5000);
 // Timeouts are used as a hack to determine if progress can be made. Making these values lower
 // than the quiescent timeout may confuse some tests into thinking that progress can still be made.
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+const VIEW_STAY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const VIEW_CHANGE_RETRANSMISSION_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -108,7 +109,7 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
         };
         let proxy = CommunicationProxy::new(configuration).await;
 
-        let view_change_manager = ViewChangeManager::new();
+        let view_change_manager = ViewChangeManager::new(VIEW_STAY_TIMEOUT);
         let (state_change_tx, mut state_change_rx) = unbounded_channel();
 
         // Just drain the state_change_rx ... don't process broadcasts
@@ -633,6 +634,28 @@ async fn test_view_change_retransmission() {
 
         // Validate that at least 4 view changes were sent (1 for the view change switch + 3 retransmissions)
         assert!(num_view_changes >= 4);
+    }
+
+}
+
+#[tokio::test]
+async fn test_view_stay_timeout() {
+    let n = 4;
+    let network = setup_mock_network::<Operation>(n).await;
+    let network = convert_network_to_kernels(network);
+
+
+    // Drive all replicas but don't don't put any activity on the network
+    let notification = drive_until_notification(&network, HashSet::new()).await;
+    // Test a view change from view 0 then another view change from view 1
+    // Give some extra time for the replicas to execute the view change protocols
+    sleep(2*VIEW_STAY_TIMEOUT + NETWORK_QUIESCENT_TIMEOUT).await;
+    notification.notify_waiters();
+
+    {
+        for replica in network {
+            assert!(replica.lock().await.view >= 2);
+        }
     }
 
 }

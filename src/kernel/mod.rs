@@ -141,6 +141,7 @@ pub struct PBFTState<O>
     message_log: Vec<PBFTEvent<O>>,
     sequence_number: SequenceNumber,
     last_executed: SequenceNumber,
+    // The deadline this replica creates after hearing a request to determine liveliness of the current view
     execution_timeout: Duration,
 
     // The "service state" being replicated is the message log associated with

@@ -8,6 +8,10 @@ pub type AtomicViewChangeManager = Arc<Mutex<ViewChangeManager>>;
 
 #[derive(Debug)]
 pub struct ViewChangeManager {
+    // The length of time that this replica will stay in a view before moving forward to keep rotating primaries
+    view_stay_timeout: Duration,
+
+    // Fields that summarizes the last seen state of the PBFT replica
     last_seen_primary: PeerIndex,
     last_seen_view: ViewstampId,
     last_seen_active_view: bool,
@@ -21,9 +25,10 @@ pub struct ViewChangeManager {
 }
 
 impl ViewChangeManager {
-    pub fn new() -> AtomicViewChangeManager {
+    pub fn new(view_stay_timeout: Duration) -> AtomicViewChangeManager {
         let (tx, rx) = channel(0);
         let manager = ViewChangeManager {
+            view_stay_timeout,
             last_seen_primary: 0,
             last_seen_view: 0,
             last_seen_active_view: true,
@@ -32,7 +37,13 @@ impl ViewChangeManager {
             requested_view_change_tx: tx,
             requested_view_change_rx: rx
         };
-        Arc::new(Mutex::new(manager))
+        let res = Arc::new(Mutex::new(manager));
+
+        // Now that the replica is (successfully) initialized into view 0, schedule a view change into
+        // the next view, view 1.
+        schedule_view_change_timeout(res.clone(), 1, view_stay_timeout);
+
+        res
     }
 
     pub fn requested_view_change_rx(&self) -> Receiver<ViewstampId> {
@@ -58,9 +69,17 @@ pub fn atomic_update_state(
     last_seen_log_length: usize
 ) -> bool
 {
+    let manager_clone = manager.clone();
     let manager = manager.lock();
     match manager {
         Ok(mut manager) => {
+            // The PBFT replica has just updated its state from an inactive view to an active view.
+            // We now need to schedule a view change for the future.
+            if !manager.last_seen_active_view && last_seen_active_view {
+                schedule_view_change_timeout(manager_clone, last_seen_view + 1, manager.view_stay_timeout);
+            }
+
+            // Atomically update the state of the replica
             manager.last_seen_primary = last_seen_primary;
             manager.last_seen_view = last_seen_view;
             manager.last_seen_active_view = last_seen_active_view;
@@ -134,6 +153,19 @@ pub fn create_successful_view_change_watchdog(
         // If last_seen_view < view or last_seen_active_view, do nothing
         // It is not a good idea to transition if the replica is still active as that could
         // negatively liveliness. A different test should be used to view change in an active view.
+    });
+}
+
+// Waits for the provided duration before scheduling a view change
+pub fn schedule_view_change_timeout(
+    manager: AtomicViewChangeManager,
+    new_view: ViewstampId,
+    timeout: Duration
+) {
+    tokio::spawn(async move {
+        sleep(timeout).await;
+        debug!("View change manager: Stay in current view has elapsed. Scheduled a view change into view {}.", new_view);
+        schedule_view_change(manager, new_view);
     });
 }
 
