@@ -304,6 +304,7 @@ pub struct CommunicationProxy<O>
     peer_senders: HashMap<PeerId, UnboundedSender<WrappedPBFTEvent<O>>>,
     // Combines all receivers into a single stream
     receiver_multiplexer: UnboundedReceiver<WrappedPBFTEvent<O>>,
+    dev_is_byzantine: bool
 }
 
 // TODO: Implement rebroadcasting to subvert byzantine peers
@@ -353,6 +354,7 @@ impl<O> CommunicationProxy<O>
             peer_db,
             peer_senders,
             receiver_multiplexer: proxy_receiver,
+            dev_is_byzantine: false
         }
     }
 
@@ -376,24 +378,38 @@ impl<O> CommunicationProxy<O>
         }
     }
 
-    pub fn broadcast(&self, event: PBFTEvent<O>) {
+    pub fn broadcast(&self, mut event: PBFTEvent<O>) {
         // We don't want to keep recomputing the digital signature which is costly.
         let packaged_event = self.wrap(&event);
         for s in self.peer_senders.values() {
+            // Perturb protocol message about to be sent if the replica is configured to be byzantine
+            let packaged_event = if !self.dev_is_byzantine {
+                packaged_event.clone()
+            } else {
+                event.mutate();
+                self.wrap(&event)
+            };
             // TODO: Handle send error
-            let _ = s.send(packaged_event.clone());
+            let _ = s.send(packaged_event);
         }
     }
 
-    pub fn send(&self, to: PeerIndex, event: PBFTEvent<O>) {
+    pub fn send(&self, to: PeerIndex, mut event: PBFTEvent<O>) {
         if to as usize >= self.indexed_participants.len() {
             panic!("Peer {} is not valid!", to);
         }
         let peer = self.indexed_participants.get(to as usize).unwrap();
         let sender = &self.peer_senders.get(&peer.id).unwrap();
 
+        // Perturb protocol message about to be sent if the replica is configured to be byzantine
+        let packaged_event = if !self.dev_is_byzantine {
+            self.wrap(&event)
+        } else {
+            event.mutate();
+            self.wrap(&event)
+        };
         // TODO: Handle send error
-        let _ = sender.send(self.wrap(&event));
+        let _ = sender.send(packaged_event);
     }
 
     pub fn num_participants(&self) -> usize {
@@ -410,5 +426,16 @@ impl<O> CommunicationProxy<O>
             info!("{:?}", e);
         }
         res
+    }
+
+    // Developer tool to make a PBFT replica malfunction. This feature must be explictly enabled
+    // through this function.
+    //
+    // This is should only be used for testing not production!
+    pub fn dev_is_byzantine(&mut self, is_byzantine: bool) {
+        if is_byzantine {
+            warn!("BYZANTINE BEHAVIOR FOR THE REPLICA HAS BEEN ENABLED. USE THIS ONLY FOR TESTING.")
+        }
+        self.dev_is_byzantine = is_byzantine;
     }
 }

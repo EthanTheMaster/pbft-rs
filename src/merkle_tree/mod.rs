@@ -195,14 +195,40 @@ impl MerkleTree {
     ) -> DigestResult {
         // The left index and right index must match iff the height is 0
         if (left_index == right_index) != (height == 0) {
-            panic!("Correctness error.");
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
         if left_index > right_index {
-            panic!("Correctness error.");
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
         // The number of elements in the interval must be 2^height
-        if (right_index - left_index + 1) != (1 << height) {
-            panic!("Correctness error.");
+        // Break up analysis to handle possible overflow
+        if height == INDEX_BITS {
+            if right_index - left_index != MerkleIndex::MAX {
+                panic!("Correctness error. \
+                right_boundary={} \
+                left_index={} \
+                right_index={} \
+                height={} \
+                ", right_boundary, left_index, right_index, height);
+            }
+        } else if (right_index - left_index + 1) != (1 << height) {
+            // Shift operation is now safe because there is no possible overflow from height
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
 
         if height == 0 {
@@ -257,14 +283,40 @@ impl MerkleTree {
     ) {
         // The left index and right index must match iff the height is 0
         if (left_index == right_index) != (height == 0) {
-            panic!("Correctness error.");
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
         if left_index > right_index {
-            panic!("Correctness error.");
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
         // The number of elements in the interval must be 2^height
-        if (right_index - left_index + 1) != (1 << height) {
-            panic!("Correctness error.");
+        // Break up analysis to handle possible overflow
+        if height == INDEX_BITS {
+            if right_index - left_index != MerkleIndex::MAX {
+                panic!("Correctness error. \
+                right_boundary={} \
+                left_index={} \
+                right_index={} \
+                height={} \
+                ", right_boundary, left_index, right_index, height);
+            }
+        } else if (right_index - left_index + 1) != (1 << height) {
+            // Shift operation is now safe because there is no possible overflow from height
+            panic!("Correctness error. \
+            right_boundary={} \
+            left_index={} \
+            right_index={} \
+            height={} \
+            ", right_boundary, left_index, right_index, height);
         }
 
         // Compute the hash at a node inductively on the height

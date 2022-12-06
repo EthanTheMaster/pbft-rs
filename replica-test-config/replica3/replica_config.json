@@ -28,5 +28,6 @@
     "view_change_timeout_ms": 5000,
     "view_change_retransmission_interval_ms": 2000,
     "reconnection_delay_ms": 2000
-  }
+  },
+  "dev_is_byzantine": false
 }

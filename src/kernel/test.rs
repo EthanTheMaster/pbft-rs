@@ -37,6 +37,12 @@ const VIEW_STAY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIEW_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const VIEW_CHANGE_RETRANSMISSION_INTERVAL: Duration = Duration::from_secs(10);
 
+// Enum to configure some tests to utilize certain kinds of faults
+enum FaultType {
+    CrashFault,
+    ByzantineFault
+}
+
 // Mock custom operation for state machine to be replicated
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum Operation {
@@ -105,7 +111,7 @@ pub async fn setup_mock_network<O>(n: usize) -> Vec<PBFTState<O>>
             peers: peers_i,
             this_replica: peers.get(i).unwrap().clone(),
             signature_secret_key: secret_keys.get(i).unwrap().clone(),
-            reconnection_delay: Duration::from_secs(1)
+            reconnection_delay: Duration::from_secs(1),
         };
         let proxy = CommunicationProxy::new(configuration).await;
 
@@ -261,7 +267,7 @@ fn convert_network_to_kernels<O: ServiceOperation>(network: Vec<PBFTState<O>>) -
         .collect::<Kernels<O>>()
 }
 
-async fn normal_operation_runner(n: usize) {
+async fn normal_operation_runner(n: usize, fault: FaultType) {
     let network = setup_mock_network::<Operation>(n).await;
     let network = convert_network_to_kernels(network);
 
@@ -277,8 +283,21 @@ async fn normal_operation_runner(n: usize) {
         communication_proxy1.broadcast(PBFTEvent::Request(RequestPayload::new(Operation::Some("Hello World2".to_string()))));
     }
 
-    // Crash f processors
-    drive_until_quiescent(&network, HashSet::from_iter(n-f as usize .. n)).await;
+    // Fail last f replica to focus the test on an operating primary in the presence of faulty followers
+    match fault {
+        FaultType::CrashFault => {
+            // Crash f processors
+            drive_until_quiescent(&network, HashSet::from_iter(n-f as usize .. n)).await;
+        }
+        FaultType::ByzantineFault => {
+            // Simulate malfunctioning replicas
+            for i in n-f as usize .. n {
+                let mut replica = network.get(i).unwrap().lock().await;
+                replica.communication_proxy.dev_is_byzantine(true);
+            }
+            drive_until_quiescent(&network, HashSet::new()).await;
+        }
+    }
 
     let target = vec![Operation::Some("Hello World1".to_string()), Operation::Some("Hello World2".to_string())];
     for state in &network[0 .. n-f as usize] {
@@ -291,16 +310,29 @@ async fn normal_operation_runner(n: usize) {
 }
 
 #[tokio::test]
-async fn test_normal_operation_mod1() {
-    normal_operation_runner(4).await;
+async fn test_normal_operation_mod1_crash() {
+    normal_operation_runner(4, FaultType::CrashFault).await;
 }
 #[tokio::test]
-async fn test_normal_operation_mod2() {
-    normal_operation_runner(14).await;
+async fn test_normal_operation_mod2_crash() {
+    normal_operation_runner(14, FaultType::CrashFault).await;
 }
 #[tokio::test]
-async fn test_normal_operation_mod0() {
-    normal_operation_runner(36).await;
+async fn test_normal_operation_mod0_crash() {
+    normal_operation_runner(36, FaultType::CrashFault).await;
+}
+
+#[tokio::test]
+async fn test_normal_operation_mod1_byzantine() {
+    normal_operation_runner(4, FaultType::ByzantineFault).await;
+}
+#[tokio::test]
+async fn test_normal_operation_mod2_byzantine() {
+    normal_operation_runner(14, FaultType::ByzantineFault).await;
+}
+#[tokio::test]
+async fn test_normal_operation_mod0_byzantine() {
+    normal_operation_runner(36, FaultType::ByzantineFault).await;
 }
 
 #[tokio::test]
@@ -452,7 +484,7 @@ async fn test_checkpoint_synchronization() {
     }
 }
 
-async fn view_change_safety_runner(n: usize) {
+async fn view_change_safety_runner(n: usize, fault: FaultType) {
     // Assume n >= 4 so some faults are allowed
     assert!(n >= 4);
 
@@ -486,7 +518,21 @@ async fn view_change_safety_runner(n: usize) {
 
     }
 
-    drive_until_quiescent(&network, HashSet::from_iter(0..f as usize)).await;
+    // Fail first f replica to focus the test failing view change primary
+    match fault {
+        FaultType::CrashFault => {
+            // Crash f processors
+            drive_until_quiescent(&network, HashSet::from_iter(0..f as usize)).await;
+        }
+        FaultType::ByzantineFault => {
+            // Simulate malfunctioning replicas
+            for i in 0..f as usize {
+                let mut replica = network.get(i).unwrap().lock().await;
+                replica.communication_proxy.dev_is_byzantine(true);
+            }
+            drive_until_quiescent(&network, HashSet::new()).await;
+        }
+    }
 
     // Trigger multiple view changes giving each replica an opportunity to be a primary
     for _ in 0..2*n {
@@ -504,16 +550,28 @@ async fn view_change_safety_runner(n: usize) {
 }
 
 #[tokio::test]
-async fn test_view_change_safety_mod1() {
-    view_change_safety_runner(4).await;
+async fn test_view_change_safety_mod1_crash() {
+    view_change_safety_runner(4, FaultType::CrashFault).await;
 }
 #[tokio::test]
-async fn test_view_change_safety_mod2() {
-    view_change_safety_runner(5).await;
+async fn test_view_change_safety_mod2_crash() {
+    view_change_safety_runner(5, FaultType::CrashFault).await;
 }
 #[tokio::test]
-async fn test_view_change_safety_mod0() {
-    view_change_safety_runner(6).await;
+async fn test_view_change_safety_mod0_crash() {
+    view_change_safety_runner(6, FaultType::CrashFault).await;
+}
+#[tokio::test]
+async fn test_view_change_safety_mod1_byzantine() {
+    view_change_safety_runner(4, FaultType::ByzantineFault).await;
+}
+#[tokio::test]
+async fn test_view_change_safety_mod2_byzantine() {
+    view_change_safety_runner(5, FaultType::ByzantineFault).await;
+}
+#[tokio::test]
+async fn test_view_change_safety_mod0_byzantine() {
+    view_change_safety_runner(6, FaultType::ByzantineFault).await;
 }
 
 #[tokio::test]
@@ -661,5 +719,3 @@ async fn test_view_stay_timeout() {
 }
 
 // TODO: Test weak certificate checkpoint synchronization from new view
-
-// TODO: Test impersonation prevention

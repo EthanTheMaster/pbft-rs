@@ -17,6 +17,7 @@ use crate::service_state::{ServiceState, ServiceStateSummary, StateTransferReque
 mod normal_operation;
 mod view_change;
 mod state_transfer;
+mod byzantine_sim;
 pub mod view_change_manager;
 
 #[cfg(test)]
@@ -271,6 +272,7 @@ impl<O> PBFTState<O>
             // Prioritize view change requests before receiving event to prevent denial of service.
             // Where events constantly arrive preventing a view change.
             new_view = self.requested_view_change.changed() => {
+                debug!("Peer {}: Step - Handle Requested View Change", self.my_index);
                 // Attempt to do view change if alerted by the manager
                 if new_view.is_err() {
                     return;
@@ -287,6 +289,7 @@ impl<O> PBFTState<O>
             }
             _ = self.view_change_retransmission_interval.tick(), if !self.is_view_active => {
                 // Retransmit the view change while not in an active view
+                debug!("Peer {}: Step - Handle Retransmission View Change", self.my_index);
                 self.communication_proxy.broadcast(PBFTEvent::ViewChange(self.create_view_change_message()));
             }
             wrapped_event = self.communication_proxy.recv_event() => {
@@ -297,30 +300,39 @@ impl<O> PBFTState<O>
                 let wrapped_event = wrapped_event.unwrap();
                 match wrapped_event.event {
                     PBFTEvent::Request(payload) => {
+                        debug!("Peer {}: Step - Handle Request", self.my_index);
                         self.process_request(payload);
                     }
                     PBFTEvent::PrePrepare { from, data, request } => {
+                        debug!("Peer {}: Step - Handle Preprepare", self.my_index);
                         self.process_preprepare(from, data, request);
                     }
                     PBFTEvent::Prepare { from, data } => {
+                        debug!("Peer {}: Step - Handle Prepare", self.my_index);
                         self.process_prepare(from, data);
                     }
                     PBFTEvent::Commit { from, data } => {
+                        debug!("Peer {}: Step - Handle Commit", self.my_index);
                         self.process_commit(from, data);
                     }
                     PBFTEvent::Checkpoint { from, data } => {
+                        debug!("Peer {}: Step - Handle Checkpoint", self.my_index);
                         self.process_checkpoint(from, data);
                     }
                     PBFTEvent::ViewChange(_) => {
+                        debug!("Peer {}: Step - Handle View Change", self.my_index);
                         self.process_view_change(wrapped_event);
                     }
                     PBFTEvent::NewView(data) => {
+                        debug!("Peer {}: Step - Handle New View", self.my_index);
                         self.process_new_view(data);
                     }
                     PBFTEvent::StateTransferRequest(req) => {
+                        debug!("Peer {}: Step - Handle State Transfer Request", self.my_index);
                         self.process_state_transfer_request(req);
                     }
                     PBFTEvent::StateTransferResponse(res) => {
+                        debug!("Peer {}: Step - Handle State Transfer Response", self.my_index);
                         self.process_state_transfer_response(res);
                     }
                 }

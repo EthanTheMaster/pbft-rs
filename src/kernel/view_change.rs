@@ -76,7 +76,7 @@ impl<O> PBFTState<O>
         };
 
         if self.view() > data.view {
-            debug!("Peer {}: Dropping view change as currently in higher view.", self.my_index);
+            debug!("Peer {}: Dropping view change as currently in higher view. {:?}", self.my_index, data);
             return;
         }
 
@@ -124,6 +124,7 @@ impl<O> PBFTState<O>
         // Record view change and save some additional info for next processing
         let from = data.from;
         let checkpoints = data.checkpoints.clone();
+        debug!("Peer {}: Received view change. {:?}", self.my_index, data);
         self.view_change_log.push(view_change);
 
         // Now that the view change has been processed, we can now safely attempt to execute other
@@ -196,6 +197,11 @@ impl<O> PBFTState<O>
         // View change is possible
         // Package all the view changes received as a collection of proofs
         let view_change_proofs = self.view_change_log.iter()
+            // Only include view changes associated with the current view
+            .filter(|e| {
+                let change = convert_to_view_change(e);
+                change.view == self.view
+            })
             .map(|e| {
                 e.witness()
             })

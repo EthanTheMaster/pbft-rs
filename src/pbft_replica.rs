@@ -72,6 +72,7 @@ pub struct ReplicaConfiguration {
     signature_public_key_pem: String,
     signature_secret_key_pem: String,
     pbft_protocol_config: PBFTProtocolConfiguration,
+    dev_is_byzantine: bool
 }
 
 pub struct PBFTReplica<O>
@@ -158,7 +159,7 @@ impl<O> PBFTReplica<O>
                     }
                 })
                 .collect();
-            let communication_proxy: CommunicationProxy<O> = CommunicationProxy::new(Configuration {
+            let mut communication_proxy: CommunicationProxy<O> = CommunicationProxy::new(Configuration {
                 peers,
                 this_replica: Peer {
                     id: config.replica_id.clone(),
@@ -166,8 +167,10 @@ impl<O> PBFTReplica<O>
                     signature_public_key: create_pk_from_pem_files(Path::new(&config.signature_public_key_pem)).unwrap()
                 },
                 signature_secret_key: create_sk_from_pem_files(Path::new(&config.signature_secret_key_pem)).unwrap(),
-                reconnection_delay: Duration::from_millis(config.pbft_protocol_config.reconnection_delay_ms as u64)
+                reconnection_delay: Duration::from_millis(config.pbft_protocol_config.reconnection_delay_ms as u64),
             }).await;
+            // Configuration to be byzantine must be explicitly enabled and will generate a warning
+            communication_proxy.dev_is_byzantine(config.dev_is_byzantine);
 
             let view_change_manager = ViewChangeManager::new(Duration::from_millis(config.pbft_protocol_config.view_stay_timeout_ms as u64));
             let mut pbft = PBFTState::new(
@@ -250,7 +253,9 @@ pub fn generate_config_skeleton(destination_dir: PathBuf) {
             view_change_timeout_ms: 10000,
             view_change_retransmission_interval_ms: 2000,
             reconnection_delay_ms: 2000
-        }
+        },
+        // To make a replica byzantine, the user must explicitly enable this dangerous feature
+        dev_is_byzantine: false
     };
 
     let skeleton_json = serde_json::to_string_pretty(&skeleton).unwrap();

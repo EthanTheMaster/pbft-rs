@@ -37,6 +37,15 @@ impl<O> PBFTState<O>
             }
             StateTransferRequest::ServiceStateItemProof { from, log_length, log_item_index } => {
                 if let Some(op) = self.current_state.log().get(log_item_index as usize) {
+                    if log_length > self.current_state.log().len() {
+                        // The requester is requesting a view of the log that is further ahead than our current state. Thus we
+                        // cannot properly respond to this request.
+                        //
+                        // Warning: Without this check an adversary can give a massive log length halting execution
+                        // which takes too long to generate a proof!
+                        return;
+                    }
+
                     // Requester presumable has validated that the checkpoint is valid so there should be a committed message
                     // at the requested sequence_number <= checkpoint_number
                     // TODO: Send more than one operation for efficiency
