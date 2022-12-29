@@ -43,36 +43,36 @@ impl<T> ServiceOperation for T
 #[derive(Serialize, Deserialize)]
 pub struct PBFTProtocolConfiguration {
     // TODO: Validate log_length >= checkpoint_interval
-    log_length: usize,
-    checkpoint_interval: usize,
+    pub log_length: usize,
+    pub checkpoint_interval: usize,
     // Deadline assigned for a request to be executed before a view change occurs
-    execution_timeout_ms: usize,
+    pub execution_timeout_ms: usize,
     // The amount of time to remain in an active view before view changing
-    view_stay_timeout_ms: usize,
+    pub view_stay_timeout_ms: usize,
     // Deadline assigned for a view with enough participants to successfully view change
-    view_change_timeout_ms: usize,
+    pub view_change_timeout_ms: usize,
     // The delay between each view change retransmission
-    view_change_retransmission_interval_ms: usize,
+    pub view_change_retransmission_interval_ms: usize,
     // The delay waited before a reconnection attempt is made to a dropped peer
-    reconnection_delay_ms: usize,
+    pub reconnection_delay_ms: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Replica {
-    id: PeerId,
-    hostname: String,
-    signature_public_key_pem: String
+    pub id: PeerId,
+    pub hostname: String,
+    pub signature_public_key_pem: String
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ReplicaConfiguration {
-    peers: Vec<Replica>,
-    replica_id: PeerId,
-    hostname: String,
-    signature_public_key_pem: String,
-    signature_secret_key_pem: String,
-    pbft_protocol_config: PBFTProtocolConfiguration,
-    dev_is_byzantine: bool
+    pub peers: Vec<Replica>,
+    pub replica_id: PeerId,
+    pub hostname: String,
+    pub signature_public_key_pem: String,
+    pub signature_secret_key_pem: String,
+    pub pbft_protocol_config: PBFTProtocolConfiguration,
+    pub dev_is_byzantine: bool
 }
 
 pub struct PBFTReplica<O>
@@ -186,12 +186,19 @@ impl<O> PBFTReplica<O>
 
             // Drive the PBFT state
             let mut request_receiver = request_receiver;
+            let mut warned_closed_request_receiver = false;
             loop {
                 select! {
-                    req = request_receiver.recv() => {
+                    // There is no point in checking this future if a closed request receiver has been detected
+                    req = request_receiver.recv(), if !warned_closed_request_receiver => {
                         if req.is_none() {
+                            // This means that the replica controller is not able to send message.
+                            // Perhaps this replica is just a redundant participant who is listening.
+                            // Breaking out of the loop will prevent this replica from making progress
+                            // so just continue.
                             warn!("Request receiver closed.");
-                            break;
+                            warned_closed_request_receiver = true;
+                            continue;
                         }
                         let req = req.unwrap();
                         pbft.broadcast_request(req);
@@ -210,6 +217,10 @@ impl<O> PBFTReplica<O>
     }
 
     pub fn send(&self, op: O) {
+        if op.digest() == O::noop().digest() {
+            warn!("No-op operation was sent. This will not change the service state.");
+            return;
+        }
         self.request_sender.send(op).unwrap();
     }
 
