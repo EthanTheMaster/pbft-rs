@@ -633,9 +633,8 @@ async fn test_view_change_to_a_correct_processor() {
     let network = convert_network_to_kernels(network);
 
     // Simulate a weak certificate sized number of replica being multiple views ahead
-    for state in &network[2..=3] {
-        state.lock().await.change_view(1000);
-    }
+    network[2].lock().await.change_view(1000);
+    network[3].lock().await.change_view(1005);
 
     // Get replicas 2 and 3 to high view number
     let notification = drive_until_notification(&network, HashSet::from([0, 1])).await;

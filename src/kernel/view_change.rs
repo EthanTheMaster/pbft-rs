@@ -22,26 +22,30 @@ impl<O> PBFTState<O>
             }
         });
         self.new_view_log.retain(|v, _| *v > self.view);
-        self.view_change_participants.retain(|v, _| {
-            *v >= self.view
-        });
         self.requested_digests.retain(|(_, v), _| *v >= self.view);
     }
     pub fn add_view_change_participant(&mut self, view: ViewstampId, participant: PeerIndex) {
-        match self.view_change_participants.get_mut(&view) {
-            None => {
-                self.view_change_participants.insert(view, HashSet::from([participant]));
-            }
-            Some(participants) => {
-                participants.insert(participant);
-            }
+        let old_view = self.last_seen_peer_viewstamp.get_mut(&participant).unwrap();
+        if *old_view < view {
+            *old_view = view;
+        } else {
+            // There is no update in the knowledge in where peers are at
+            return;
         }
 
         // Determine which liveliness conditions are enabled
-        let participants = self.view_change_participants.get(&view).unwrap();
+        let current_view_participants = self.last_seen_peer_viewstamp.iter()
+            .filter_map(|(p, v)| {
+                if *v == self.view {
+                    Some(*p)
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<PeerIndex>>();
         // If in the process of doing a view change and there is now a quorum view changing in the
         // same view, setup a deadline to get into this new view
-        if !self.is_view_active && self.view == view && participants.len() >= self.quorum_size() as usize {
+        if !self.is_view_active && current_view_participants.len() >= self.quorum_size() as usize {
             create_successful_view_change_watchdog(
                 self.view_change_manager.clone(),
                 self.view(),
@@ -50,20 +54,47 @@ impl<O> PBFTState<O>
         }
 
         if !self.is_view_active {
+            let mut seen_views = self.last_seen_peer_viewstamp.iter()
+                .map(|(_, v)| *v)
+                .collect::<Vec<ViewstampId>>();
+            seen_views.sort();
+
             // Some correct replica is attempting to view change in a strictly higher view. Transition to
             // that view
-            let higher_view = self.view_change_participants.iter()
-                .filter(|(v, p)| {
-                    self.view < **v && p.len() >= self.weak_certificate_size() as usize
-                })
-                .map(|(v, _)| *v)
-                .max();
-            if let Some(higher_view) = higher_view {
-                schedule_view_change(self.view_change_manager.clone(), higher_view);
-                info!("Peer {}: Changing to view {} because some correct processor is view changing in that view.", self.my_index, higher_view);
+            let weak_quorum_supported_view = seen_views[self.num_participants as usize - self.weak_certificate_size() as usize];
+
+            if weak_quorum_supported_view > self.view {
+                schedule_view_change(self.view_change_manager.clone(), weak_quorum_supported_view);
+                info!("Peer {}: Changing to view {} because some correct processor is view changing in that view.", self.my_index, weak_quorum_supported_view);
             }
         }
 
+    }
+
+    fn is_valid_view_change(&self, data: &ViewChange) -> bool {
+        if !data.prepared.iter().all(|prep| {
+            let (n, v) = (prep.sequence_number, prep.view);
+            v < data.view
+                && data.log_low_mark < n
+                && n <= data.log_low_mark + self.sequence_window_length
+        }) {
+            return false;
+        }
+        if !data.preprepared.iter().all(|prep| {
+            let (n, v) = (prep.sequence_number, prep.view);
+            v < data.view
+                && data.log_low_mark < n
+                && n <= data.log_low_mark + self.sequence_window_length
+        }) {
+            return false;
+        }
+        if !data.checkpoints.iter().all(|c| {
+            data.log_low_mark <= c.sequence_number && c.sequence_number <= data.log_low_mark + self.sequence_window_length
+        }) {
+            return false;
+        }
+
+        true
     }
 
     pub fn process_view_change(&mut self, view_change: WrappedPBFTEvent<O>) {
@@ -98,26 +129,11 @@ impl<O> PBFTState<O>
             return;
         }
 
-        // Check that the data in view change is correct
-        if !data.prepared.iter().all(|prep| {
-            let (n, v) = (prep.sequence_number, prep.view);
-            v < data.view
-                && data.log_low_mark < n
-                && n <= data.log_low_mark + self.sequence_window_length
-        }) {
-            warn!("Peer {}: Received view change from peer {} with malformed prepared field!", self.my_index, data.from);
+        // As primary, discard any invalid view changes
+        if !self.is_valid_view_change(data) {
+            warn!("Peer {}: Received malformed view change from peer {}!", self.my_index, data.from);
             return;
         }
-        if !data.preprepared.iter().all(|prep| {
-            let (n, v) = (prep.sequence_number, prep.view);
-            v < data.view
-                && data.log_low_mark < n
-                && n <= data.log_low_mark + self.sequence_window_length
-        }) {
-            warn!("Peer {}: Received view change from peer {} with malformed preprepared field!", self.my_index, data.from);
-            return;
-        }
-
 
         // All preconditions passed
 
@@ -249,7 +265,7 @@ impl<O> PBFTState<O>
                 match result {
                     Ok(e) => {
                         if let PBFTEvent::ViewChange(change) = &e.event {
-                            change.view == data.view
+                            change.view == data.view && self.is_valid_view_change(change)
                         } else {
                             false
                         }

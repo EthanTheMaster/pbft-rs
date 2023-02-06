@@ -182,9 +182,9 @@ pub struct PBFTState<O>
     view_change_timeout: Duration,
     view_change_retransmission_interval: Interval,
     view_change_log: Vec<WrappedPBFTEvent<O>>,
-    // This map tracks who has been seen in a view. That is, let (v, P) be an entry
-    // in this map. If some peer is in P, then that peer has been seen in view v.
-    view_change_participants: HashMap<ViewstampId, HashSet<PeerIndex>>,
+    // This map tracks who has been seen in a view. That is, (p, v) indicates
+    // that peer p has last been seen in view v.
+    last_seen_peer_viewstamp: HashMap<PeerIndex, ViewstampId>,
     new_view_log: HashMap<ViewstampId, NewView>,
     requested_digests: HashMap<(SequenceNumber, ViewstampId), DigestResult>,
 
@@ -241,7 +241,7 @@ impl<O> PBFTState<O>
             view_change_timeout,
             view_change_retransmission_interval: interval(view_change_retransmission_interval),
             view_change_log: vec![],
-            view_change_participants: Default::default(),
+            last_seen_peer_viewstamp: HashMap::from_iter((0..num_participants).map(|p| (p, 0))),
             new_view_log: Default::default(),
             requested_digests: Default::default(),
             known_service_state_digests: Default::default(),
